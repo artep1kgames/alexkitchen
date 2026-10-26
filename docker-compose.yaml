@@ -1,0 +1,49 @@
+
+services:
+  comments-app:
+    build:
+      context: ./comments-app
+      dockerfile: Dockerfile
+    image: alexkitchen/comments-app:latest
+    container_name: alex-comments
+    restart: unless-stopped
+
+    ports:
+      - "8081:8081"
+
+    env_file:
+      - ./.env
+
+    environment:
+      TZ: Europe/Moscow
+
+    volumes:
+      - ./comments-app/comments.json:/app/comments.json
+      - ./comments-app/products.json:/app/products.json
+      - ./comments-app/pending-orders.jsonl:/app/pending-orders.jsonl
+      - ./comments-app/confirmed-orders.txt:/app/confirmed-orders.txt
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8081/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  max-bot:
+    build:
+      context: ./alex-kitchen-go-bot
+      dockerfile: Dockerfile
+    image: alexkitchen/max-bot:latest
+    container_name: alex-max-bot
+    restart: unless-stopped
+
+    env_file:
+      - ./.env
+
+    environment:
+      TZ: Europe/Moscow
+
+    depends_on:
+      comments-app:
+        condition: service_healthy

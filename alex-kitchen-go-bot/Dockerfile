@@ -20,6 +20,10 @@ RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /app
 
+RUN apt update
+RUN apt install --reinstall ca-certificates -y
+RUN update-ca-certificates
+
 COPY --from=builder /bot ./bot
 
 ENV TZ=Europe/Moscow

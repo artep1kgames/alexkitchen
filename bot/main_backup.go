@@ -1,0 +1,707 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/smtp"
+	"os"
+	"os/signal"
+	"regexp"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+	"unicode"
+
+	"github.com/joho/godotenv"
+	maxbot "github.com/max-messenger/max-bot-api-client-go"
+)
+
+const (
+	privacyURL  = "https://xn--80aaebn4a2aiibs.xn--p1ai/politika"
+	giftURL     = "https://disk.yandex.ru/d/TUXWwEoOjSgT3Q"
+	siteURL     = "https://векторправа.рф"
+	vkURL       = "https://vk.com/"
+	maxGroupURL = "https://max.ru/id525204324295_biz"
+)
+
+type QuizState struct {
+	Step int
+
+	Phone            string
+	City             string
+	DebtAmount       string
+	Mortgage         string
+	ConsultationType string
+	CallTime         string
+}
+
+var (
+	stateMu        sync.Mutex
+	userQuizStates = make(map[int64]*QuizState)
+	userPhones     = make(map[int64]string)
+)
+
+type Attachment struct {
+	Type    string `json:"type"`
+	Payload struct {
+		VCFInfo string `json:"vcf_info"`
+		Hash    string `json:"hash"`
+		MaxInfo any    `json:"max_info"`
+	} `json:"payload"`
+}
+
+type WebhookUpdate struct {
+	UpdateType string `json:"update_type"`
+	ChatID     int64  `json:"chat_id"`
+	Message    struct {
+		Recipient struct {
+			ChatID int64 `json:"chat_id"`
+			UserID int64 `json:"user_id"`
+		} `json:"recipient"`
+		Body struct {
+			Text        string       `json:"text"`
+			Attachments []Attachment `json:"attachments"`
+			Contact     struct {
+				Phone       string `json:"phone"`
+				PhoneNumber string `json:"phone_number"`
+			} `json:"contact"`
+		} `json:"body"`
+		Attachments []Attachment `json:"attachments"`
+		Contact     struct {
+			Phone       string `json:"phone"`
+			PhoneNumber string `json:"phone_number"`
+		} `json:"contact"`
+		Text string `json:"text"`
+	} `json:"message"`
+}
+
+type InlineKeyboardAttachment struct {
+	Type    string `json:"type"`
+	Payload struct {
+		Buttons [][]InlineButton `json:"buttons"`
+	} `json:"payload"`
+}
+
+type InlineButton struct {
+	Type    string `json:"type"`
+	Text    string `json:"text"`
+	URL     string `json:"url,omitempty"`
+	Payload string `json:"payload,omitempty"`
+}
+
+type RawMessageBody struct {
+	Text        string                     `json:"text"`
+	Notify      bool                       `json:"notify"`
+	Format      string                     `json:"format,omitempty"`
+	Attachments []InlineKeyboardAttachment `json:"attachments,omitempty"`
+}
+
+func newInlineKeyboard(rows ...[]InlineButton) []InlineKeyboardAttachment {
+	kb := InlineKeyboardAttachment{Type: "inline_keyboard"}
+	kb.Payload.Buttons = rows
+	return []InlineKeyboardAttachment{kb}
+}
+
+func messageButton(text string) InlineButton {
+	return InlineButton{Type: "message", Text: text}
+}
+
+func linkButton(text, url string) InlineButton {
+	return InlineButton{Type: "link", Text: text, URL: url}
+}
+
+func contactButton(text string) InlineButton {
+	return InlineButton{Type: "request_contact", Text: text}
+}
+
+func consentInlineKeyboard() []InlineKeyboardAttachment {
+	return newInlineKeyboard(
+		[]InlineButton{messageButton("Хочу консультацию с юристом")},
+		[]InlineButton{linkButton("Политика обработки данных", privacyURL)},
+	)
+}
+
+func phoneInlineKeyboard() []InlineKeyboardAttachment {
+	return newInlineKeyboard(
+		[]InlineButton{contactButton("Поделиться контактом")},
+	)
+}
+
+func giftInlineKeyboard() []InlineKeyboardAttachment {
+	return newInlineKeyboard(
+		[]InlineButton{linkButton("Подарок", giftURL)},
+		[]InlineButton{messageButton("Перейти к вопросам")},
+	)
+}
+
+func startQuestionsInlineKeyboard() []InlineKeyboardAttachment {
+	return newInlineKeyboard(
+		[]InlineButton{messageButton("Перейти к вопросам")},
+	)
+}
+
+func finalInlineKeyboard() []InlineKeyboardAttachment {
+	return newInlineKeyboard(
+		[]InlineButton{linkButton("Официальный сайт компании", siteURL)},
+		[]InlineButton{linkButton("Наша страница в ВК", vkURL)},
+		[]InlineButton{linkButton("Наша группа в MAX", maxGroupURL)},
+	)
+}
+
+func debtKeyboard() *maxbot.Keyboard {
+	kb := &maxbot.Keyboard{}
+	kb.AddRow().AddMessage("Долг более 300 тыс. руб")
+	kb.AddRow().AddMessage("Долг менее 300 тыс. руб")
+	return kb
+}
+
+func yesNoKeyboard() *maxbot.Keyboard {
+	kb := &maxbot.Keyboard{}
+	kb.AddRow().AddMessage("ДА").AddMessage("НЕТ")
+	return kb
+}
+
+func consultationKeyboard() *maxbot.Keyboard {
+	kb := &maxbot.Keyboard{}
+	kb.AddRow().AddMessage("Звонок").AddMessage("Видео")
+	return kb
+}
+
+func send(ctx context.Context, api *maxbot.Api, chatID int64, text string, kb *maxbot.Keyboard) {
+	msg := maxbot.NewMessage().SetChat(chatID).SetText(text)
+	if kb != nil {
+		msg = msg.AddKeyboard(kb)
+	}
+
+	if err := api.Messages.Send(ctx, msg); err != nil {
+		fmt.Println("Ошибка отправки сообщения:", err)
+	}
+}
+
+func sendInline(ctx context.Context, chatID int64, text string, attachments []InlineKeyboardAttachment) {
+	token := os.Getenv("BOT_TOKEN")
+	if token == "" {
+		fmt.Println("Ошибка отправки inline-сообщения: BOT_TOKEN пустой")
+		return
+	}
+
+	baseURL := os.Getenv("MAX_API_BASE")
+	if baseURL == "" {
+		baseURL = "https://botapi.max.ru"
+	}
+
+	body := RawMessageBody{
+		Text:        text,
+		Notify:      true,
+		Attachments: attachments,
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		fmt.Println("Ошибка json.Marshal:", err)
+		return
+	}
+
+	url := fmt.Sprintf("%s/messages?chat_id=%d", strings.TrimRight(baseURL, "/"), chatID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		fmt.Println("Ошибка создания HTTP-запроса:", err)
+		return
+	}
+
+	req.Header.Set("Authorization", token)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println("Ошибка отправки inline-сообщения:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		fmt.Printf("MAX API inline error: HTTP %d: %s\n", resp.StatusCode, string(respBody))
+	}
+}
+
+func sendWelcome(ctx context.Context, chatID int64) {
+	stateMu.Lock()
+	delete(userQuizStates, chatID)
+	delete(userPhones, chatID)
+	stateMu.Unlock()
+
+	sendInline(
+		ctx,
+		chatID,
+		"Для продолжения работы и записи на бесплатную консультацию к юристу ЮК «Вектор Права» оставьте свой номер телефона.\n\n"+
+			"Нажимая кнопку ниже и продолжая общение в боте, вы соглашаетесь на обработку персональных данных.\n\n"+
+			"Ваши персональные данные защищены законом.\n\n"+
+			"Чтобы продолжить, нажмите кнопку «Хочу консультацию с юристом».",
+		consentInlineKeyboard(),
+	)
+}
+
+func sendPhoneRequest(ctx context.Context, chatID int64) {
+	sendInline(
+		ctx,
+		chatID,
+		"Напишите свой номер телефона для связи или нажмите кнопку «Поделиться контактом» ниже.\n\n"+
+			"Мы направим вам подарки:\n\n"+
+			"✅ Чек-лист: «Как правильно оценить свое финансовое положение, связанное с долгами».\n"+
+			"✅ Чек-лист: «Как понять, могу ли я списать свои долги законно».\n"+
+			"✅ Чек-лист: «Как списать долги БЕСПЛАТНО через МФЦ».\n"+
+			"✅ Чек-лист: «Самые распространённые “страшилки” МФО и коллекторов».\n\n"+
+			"Кроме этого, после консультации вы получите персональный доступ в закрытый чат поддержки, где находятся клиенты компании, которые уже проходят процедуру списания долгов либо уже успешно ее завершили.\n\n"+
+			"Нажмите кнопку «Поделиться контактом», и наш специалист свяжется с вами для детального разбора ситуации.",
+		phoneInlineKeyboard(),
+	)
+}
+
+func normalizeText(text string) string {
+	return strings.TrimSpace(text)
+}
+
+func isValidPhone(text string) bool {
+	cleaned := strings.TrimSpace(text)
+	if cleaned == "" {
+		return false
+	}
+
+	digitsCount := 0
+	for _, r := range cleaned {
+		switch {
+		case unicode.IsDigit(r):
+			digitsCount++
+		case r == '+' || r == '-' || r == '(' || r == ')' || unicode.IsSpace(r):
+		default:
+			return false
+		}
+	}
+
+	return digitsCount >= 10
+}
+
+func normalizePhone(text string) string {
+	var b strings.Builder
+	for _, r := range text {
+		if unicode.IsDigit(r) || r == '+' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func extractPhoneFromVCF(vcf string) string {
+	if vcf == "" {
+		return ""
+	}
+
+	re := regexp.MustCompile(`(?im)^TEL[^:]*:([+\d\s().-]+)`)
+	match := re.FindStringSubmatch(vcf)
+	if len(match) < 2 {
+		return ""
+	}
+
+	phone := normalizePhone(match[1])
+	if isValidPhone(phone) {
+		return phone
+	}
+
+	return ""
+}
+
+func verifyContactHash(token, vcfInfo, gotHash string) bool {
+	if token == "" || vcfInfo == "" || gotHash == "" {
+		return false
+	}
+
+	normalized := strings.ReplaceAll(vcfInfo, `\r\n`, "\r\n")
+	mac := hmac.New(sha256.New, []byte(token))
+	mac.Write([]byte(normalized))
+	expected := hex.EncodeToString(mac.Sum(nil))
+
+	return hmac.Equal([]byte(strings.ToLower(expected)), []byte(strings.ToLower(gotHash)))
+}
+
+func isDebtAmount(text string) bool {
+	return text == "Долг более 300 тыс. руб" || text == "Долг менее 300 тыс. руб"
+}
+
+func isYesNo(text string) bool {
+	return text == "ДА" || text == "НЕТ" || text == "Да" || text == "Нет"
+}
+
+func isConsultationType(text string) bool {
+	return text == "Звонок" || text == "Видео"
+}
+
+func startQuiz(ctx context.Context, api *maxbot.Api, chatID int64) {
+	stateMu.Lock()
+	phone := userPhones[chatID]
+	userQuizStates[chatID] = &QuizState{Step: 1, Phone: phone}
+	stateMu.Unlock()
+
+	send(ctx, api, chatID, "1. Из какого вы города?", nil)
+}
+
+func getState(chatID int64) *QuizState {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	return userQuizStates[chatID]
+}
+
+func setPhone(chatID int64, phone string) {
+	stateMu.Lock()
+	userPhones[chatID] = phone
+	stateMu.Unlock()
+}
+
+func handleQuizStep(ctx context.Context, api *maxbot.Api, chatID int64, text string, state *QuizState) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+
+	switch state.Step {
+	case 1:
+		state.City = text
+		state.Step = 2
+		go send(ctx, api, chatID, "2. Какой размер ваших долгов?\n\nУчитываются даже те кредиты и займы, по которым вы до сих пор платите.", debtKeyboard())
+		return
+
+	case 2:
+		if !isDebtAmount(text) {
+			go send(ctx, api, chatID, "Пожалуйста, выберите один из вариантов кнопкой ниже.", debtKeyboard())
+			return
+		}
+		state.DebtAmount = text
+		state.Step = 3
+		go send(ctx, api, chatID, "3. Есть ли у Вас ипотека?\n\nУчитывается любая недвижимость, находящаяся в ипотеке.", yesNoKeyboard())
+		return
+
+	case 3:
+		if !isYesNo(text) {
+			go send(ctx, api, chatID, "Пожалуйста, ответьте кнопкой: ДА или НЕТ.", yesNoKeyboard())
+			return
+		}
+		state.Mortgage = text
+		state.Step = 4
+		go send(ctx, api, chatID, "4. Вам удобна консультация по телефону или по видеосвязи?", consultationKeyboard())
+		return
+
+	case 4:
+		if !isConsultationType(text) {
+			go send(ctx, api, chatID, "Пожалуйста, выберите формат консультации кнопкой ниже.", consultationKeyboard())
+			return
+		}
+		state.ConsultationType = text
+		state.Step = 5
+		go send(ctx, api, chatID, "5. В какое время вам удобно принять звонок?", nil)
+		return
+
+	case 5:
+		state.CallTime = text
+		stateCopy := *state
+		delete(userQuizStates, chatID)
+		delete(userPhones, chatID)
+
+		go func() {
+			if err := sendApplicationEmail(chatID, &stateCopy); err != nil {
+				fmt.Println("Ошибка отправки email:", err)
+				send(ctx, api, chatID, "Спасибо за ваши ответы. Но при отправке заявки произошла ошибка. Пожалуйста, попробуйте чуть позже.", nil)
+				return
+			}
+
+			sendInline(
+				ctx,
+				chatID,
+				"Спасибо, что ответили на вопросы. Наш специалист свяжется с вами в указанное вами время, просим вас быть на связи.\n\n"+
+					"Пока ожидаете связи со специалистом, вы можете подробнее узнать о нас и посмотреть отзывы о нашей работе:",
+				finalInlineKeyboard(),
+			)
+		}()
+		return
+	}
+}
+
+func sendApplicationEmail(chatID int64, state *QuizState) error {
+	smtpHost := os.Getenv("SMTP_HOST")
+	smtpPort := os.Getenv("SMTP_PORT")
+	emailFrom := os.Getenv("EMAIL_FROM")
+	emailPassword := os.Getenv("EMAIL_PASSWORD")
+	emailTo := os.Getenv("EMAIL_TO")
+
+	if smtpHost == "" || smtpPort == "" || emailFrom == "" || emailPassword == "" || emailTo == "" {
+		return fmt.Errorf("не заполнены SMTP-переменные в .env")
+	}
+
+	subject := "Новая заявка из MAX-бота"
+	body := fmt.Sprintf(
+		"Новая заявка из MAX-бота\n\n"+
+			"Chat ID: %d\n"+
+			"Телефон: %s\n"+
+			"Город: %s\n"+
+			"Размер долга: %s\n"+
+			"Ипотека: %s\n"+
+			"Формат консультации: %s\n"+
+			"Удобное время для звонка: %s\n",
+		chatID,
+		state.Phone,
+		state.City,
+		state.DebtAmount,
+		state.Mortgage,
+		state.ConsultationType,
+		state.CallTime,
+	)
+
+	message := []byte(
+		"To: " + emailTo + "\r\n" +
+			"Subject: " + subject + "\r\n" +
+			"MIME-Version: 1.0\r\n" +
+			"Content-Type: text/plain; charset=\"UTF-8\"\r\n" +
+			"\r\n" +
+			body,
+	)
+
+	auth := smtp.PlainAuth("", emailFrom, emailPassword, smtpHost)
+	return smtp.SendMail(smtpHost+":"+smtpPort, auth, emailFrom, []string{emailTo}, message)
+}
+
+func extractContactPhoneFromAttachments(attachments []Attachment) string {
+	token := os.Getenv("BOT_TOKEN")
+
+	for _, att := range attachments {
+		if att.Type != "contact" {
+			continue
+		}
+
+		phone := extractPhoneFromVCF(att.Payload.VCFInfo)
+		if phone == "" {
+			continue
+		}
+
+		if att.Payload.Hash != "" {
+			if verifyContactHash(token, att.Payload.VCFInfo, att.Payload.Hash) {
+				fmt.Println("Контакт MAX подтверждён hash")
+			} else {
+				fmt.Println("⚠️ Контакт получен, но hash не совпал")
+			}
+		}
+
+		return phone
+	}
+
+	return ""
+}
+
+func extractChatIDTextAndPhone(upd WebhookUpdate) (int64, string, string) {
+	chatID := upd.ChatID
+	if chatID == 0 {
+		chatID = upd.Message.Recipient.ChatID
+	}
+	if chatID == 0 {
+		chatID = upd.Message.Recipient.UserID
+	}
+
+	text := upd.Message.Body.Text
+	if text == "" {
+		text = upd.Message.Text
+	}
+
+	phone := upd.Message.Body.Contact.Phone
+	if phone == "" {
+		phone = upd.Message.Body.Contact.PhoneNumber
+	}
+	if phone == "" {
+		phone = upd.Message.Contact.Phone
+	}
+	if phone == "" {
+		phone = upd.Message.Contact.PhoneNumber
+	}
+	if phone == "" {
+		phone = extractContactPhoneFromAttachments(upd.Message.Body.Attachments)
+	}
+	if phone == "" {
+		phone = extractContactPhoneFromAttachments(upd.Message.Attachments)
+	}
+
+	return chatID, normalizeText(text), normalizeText(phone)
+}
+
+func handleBotUpdate(ctx context.Context, api *maxbot.Api, upd WebhookUpdate) {
+	chatID, text, phoneFromContact := extractChatIDTextAndPhone(upd)
+	if chatID == 0 {
+		fmt.Printf("Не смог определить chat_id из update: %+v\n", upd)
+		return
+	}
+
+	if upd.UpdateType == "bot_started" {
+		sendWelcome(ctx, chatID)
+		return
+	}
+
+	if upd.UpdateType != "" && upd.UpdateType != "message_created" {
+		fmt.Println("Пропускаю update_type:", upd.UpdateType)
+		return
+	}
+
+	if phoneFromContact != "" && isValidPhone(phoneFromContact) {
+		phone := normalizePhone(phoneFromContact)
+		fmt.Println("ChatID:", chatID, "Контактный телефон:", phone)
+		setPhone(chatID, phone)
+		sendInline(ctx, chatID, "Обещанные полезные файлы можно забрать по кнопке «Подарок».", giftInlineKeyboard())
+		return
+	}
+
+	if text == "" {
+		return
+	}
+
+	fmt.Println("ChatID:", chatID, "Сообщение:", text)
+
+	if state := getState(chatID); state != nil {
+		handleQuizStep(ctx, api, chatID, text, state)
+		return
+	}
+
+	switch text {
+	case "/start", "Старт", "Начать":
+		sendWelcome(ctx, chatID)
+		return
+
+	case "Хочу консультацию с юристом":
+		sendPhoneRequest(ctx, chatID)
+		return
+
+	case "Поделиться номером", "Поделиться контактом":
+		sendPhoneRequest(ctx, chatID)
+		return
+
+	case "Подарок":
+		sendInline(ctx, chatID, "Обещанные полезные файлы можно забрать по кнопке ниже.", startQuestionsInlineKeyboard())
+		return
+
+	case "Перейти к вопросам":
+		startQuiz(ctx, api, chatID)
+		return
+	}
+
+	if isValidPhone(text) {
+		phone := normalizePhone(text)
+		setPhone(chatID, phone)
+		sendInline(ctx, chatID, "Обещанные полезные файлы можно забрать по кнопке «Подарок».", giftInlineKeyboard())
+		return
+	}
+
+	sendWelcome(ctx, chatID)
+}
+
+func webhookHandler(ctx context.Context, api *maxbot.Api, secret string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if secret != "" && r.Header.Get("X-Max-Bot-Api-Secret") != secret {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
+
+		var upd WebhookUpdate
+		if err := json.Unmarshal(body, &upd); err != nil {
+			fmt.Println("Ошибка парсинга webhook update:", err, "body:", string(body))
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true}`))
+
+		go handleBotUpdate(ctx, api, upd)
+	}
+}
+
+func main() {
+	if err := godotenv.Load(); err != nil {
+		fmt.Println("⚠️ .env не найден, пробуем переменные системы")
+	}
+
+	token := os.Getenv("BOT_TOKEN")
+	if token == "" {
+		fmt.Println("Ошибка: переменная BOT_TOKEN не найдена")
+		return
+	}
+
+	listenAddr := os.Getenv("LISTEN_ADDR")
+	if listenAddr == "" {
+		listenAddr = ":8080"
+	}
+
+	webhookSecret := os.Getenv("WEBHOOK_SECRET")
+	if webhookSecret == "" {
+		fmt.Println("⚠️ WEBHOOK_SECRET не задан. Webhook будет принимать запросы без проверки X-Max-Bot-Api-Secret")
+	}
+
+	api, err := maxbot.New(token, maxbot.WithApiTimeout(20*time.Second))
+	if err != nil {
+		fmt.Println("Ошибка создания клиента MAX:", err)
+		return
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+
+	info, err := api.Bots.GetBot(ctx)
+	fmt.Printf("Bot info: %#v\n", info)
+	fmt.Printf("Bot info error: %#v\n", err)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/webhook", webhookHandler(ctx, api, webhookSecret))
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	server := &http.Server{
+		Addr:              listenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+	}
+
+	go func() {
+		fmt.Println("Webhook bot запущен. Слушаю", listenAddr)
+		fmt.Println("Endpoint: /webhook")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Println("Ошибка HTTP-сервера:", err)
+			stop()
+		}
+	}()
+
+	<-ctx.Done()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		fmt.Println("Ошибка graceful shutdown:", err)
+	}
+
+	fmt.Println("Бот остановлен")
+}

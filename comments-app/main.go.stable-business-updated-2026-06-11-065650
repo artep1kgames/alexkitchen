@@ -1,0 +1,1906 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Comment struct {
+	ID        int64  `json:"id"`
+	PostID    string `json:"post_id"`
+	UserID    string `json:"user_id"`
+	Name      string `json:"name"`
+	Username  string `json:"username"`
+	Text      string `json:"text"`
+	CreatedAt string `json:"created_at"`
+}
+
+type Store struct {
+	mu       sync.Mutex
+	Comments []Comment `json:"comments"`
+}
+
+var storePath = "comments.json"
+var store = Store{}
+var pageTpl = template.Must(template.New("page").Parse(pageHTML))
+
+func loadStore() {
+	data, err := os.ReadFile(storePath)
+	if err != nil {
+		store.Comments = []Comment{}
+		return
+	}
+	_ = json.Unmarshal(data, &store)
+}
+
+func saveStore() error {
+	data, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(storePath, data, 0644)
+}
+
+func commentsPage(w http.ResponseWriter, r *http.Request) {
+	postID := strings.TrimSpace(r.URL.Query().Get("post"))
+	if postID == "" {
+		postID = strings.TrimSpace(r.URL.Query().Get("WebAppStartParam"))
+	}
+	if postID == "" {
+		postID = "waiting"
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = pageTpl.Execute(w, map[string]string{"PostID": postID})
+}
+
+func apiList(w http.ResponseWriter, r *http.Request) {
+	postID := strings.TrimSpace(r.URL.Query().Get("post"))
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	var result []Comment
+	for _, c := range store.Comments {
+		if c.PostID == postID {
+			result = append(result, c)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+func apiAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PostID   string `json:"post_id"`
+		UserID   string `json:"user_id"`
+		Name     string `json:"name"`
+		Username string `json:"username"`
+		Text     string `json:"text"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	req.PostID = strings.TrimSpace(req.PostID)
+	req.UserID = strings.TrimSpace(req.UserID)
+	req.Name = strings.TrimSpace(req.Name)
+	req.Username = strings.TrimSpace(req.Username)
+	req.Text = strings.TrimSpace(req.Text)
+
+	if req.PostID == "" || req.Text == "" {
+		http.Error(w, "post_id and text are required", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		req.Name = "Пользователь MAX"
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	comment := Comment{
+		ID:        time.Now().UnixNano(),
+		PostID:    req.PostID,
+		UserID:    req.UserID,
+		Name:      req.Name,
+		Username:  req.Username,
+		Text:      req.Text,
+		CreatedAt: time.Now().Format("02.01.2006 15:04"),
+	}
+
+	store.Comments = append(store.Comments, comment)
+	_ = saveStore()
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(comment)
+}
+
+func appPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(appHTML))
+}
+
+func shopPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(shopHTML))
+}
+
+func health(w http.ResponseWriter, r *http.Request) {
+	_, _ = w.Write([]byte("ok"))
+}
+
+func main() {
+	loadStore()
+
+	http.HandleFunc("/health", health)
+	http.HandleFunc("/app", appPage)
+	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
+	http.HandleFunc("/shop", shopPage)
+	http.HandleFunc("/api/order", orderHandler)
+	http.HandleFunc("/comments", commentsPage)
+	http.HandleFunc("/api/comments", apiList)
+	http.HandleFunc("/api/comments/add", apiAdd)
+
+	log.Println("comments app started on :8081")
+	log.Fatal(http.ListenAndServe(":8081", nil))
+}
+
+const pageHTML = `<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Комментарии</title>
+<script src="https://st.max.ru/js/max-web-app.js">
+
+
+
+
+</script>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;color:#111}
+body{
+  background:#82c5ff;
+  overflow:hidden;
+}
+.app{
+  height:100vh;
+  display:flex;
+  flex-direction:column;
+  background:
+    radial-gradient(circle at 20% 20%, rgba(255,255,255,.25), transparent 24%),
+    linear-gradient(180deg,#bde2ff 0%,#7bc2ff 45%,#71bcf6 100%);
+}
+.header{
+  height:64px;
+  background:#fff;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  position:relative;
+  box-shadow:0 1px 0 rgba(0,0,0,.08);
+  flex:0 0 auto;
+  border-bottom-left-radius:18px;
+  border-bottom-right-radius:18px;
+}
+.header-title{font-size:21px;font-weight:800}
+.close{
+  position:absolute;left:18px;top:17px;
+  width:30px;height:30px;border:0;background:transparent;font-size:34px;line-height:24px;color:#111;
+}
+.menu{
+  position:absolute;right:18px;top:16px;width:34px;height:34px;border-radius:50%;
+  border:2px solid #222;background:#fff;font-size:18px;font-weight:800;
+}
+.toolbar{
+  display:flex;align-items:center;justify-content:center;gap:12px;
+  padding:14px 16px 8px;
+  flex:0 0 auto;
+}
+.pill{
+  background:#fff;
+  border-radius:999px;
+  padding:12px 28px;
+  font-size:18px;
+  font-weight:700;
+  box-shadow:0 2px 8px rgba(0,0,0,.06);
+}
+.day{
+  align-self:center;
+  background:rgba(26,132,207,.70);
+  color:#fff;
+  border-radius:999px;
+  padding:6px 14px;
+  font-size:16px;
+  margin:4px 0 10px;
+  flex:0 0 auto;
+}
+.chat{
+  flex:1 1 auto;
+  overflow-y:auto;
+  padding:0 14px 96px;
+}
+.row{
+  display:flex;
+  align-items:flex-end;
+  gap:9px;
+  margin:10px 0;
+}
+.avatar{
+  width:42px;height:42px;border-radius:50%;
+  background:linear-gradient(135deg,#177de8,#78c8ff);
+  color:#fff;
+  display:flex;align-items:center;justify-content:center;
+  font-weight:800;font-size:18px;
+  flex:0 0 auto;
+  box-shadow:0 1px 4px rgba(0,0,0,.16);
+}
+.bubble{
+  background:#fff;
+  border-radius:18px 18px 18px 4px;
+  padding:10px 12px 9px;
+  max-width:78%;
+  box-shadow:0 1px 4px rgba(0,0,0,.12);
+}
+.name{font-size:17px;font-weight:800;line-height:1.28;color:#17181c;}
+.text{
+  font-size:19px;
+  line-height:1.28;
+  white-space:pre-wrap;
+  word-break:break-word;
+}
+.time{
+  color:#808080;
+  font-size:13px;
+  text-align:right;
+  margin-top:3px;
+}
+.empty{
+  margin:40px auto 0;
+  background:rgba(255,255,255,.82);
+  color:#333;
+  border-radius:18px;
+  padding:18px;
+  max-width:320px;
+  text-align:center;
+  font-size:17px;
+}
+.composer{
+  position:fixed;
+  left:0;right:0;bottom:0;
+  padding:10px 10px calc(10px + env(safe-area-inset-bottom));
+  background:rgba(255,255,255,.96);
+  display:flex;
+  align-items:center;
+  gap:8px;
+  border-top-left-radius:22px;
+  border-top-right-radius:22px;
+  box-shadow:0 -2px 12px rgba(0,0,0,.12);
+}
+.attach{
+  width:42px;height:42px;border:0;background:transparent;font-size:30px;color:#222;
+  flex:0 0 auto;
+}
+.input{
+  flex:1;
+  min-height:44px;
+  max-height:110px;
+  border:0;
+  outline:none;
+  resize:none;
+  border-radius:16px;
+  background:#f2f3f5;
+  padding:12px 14px;
+  font-size:18px;
+  color:#111;
+}
+.send{
+  width:48px;height:48px;border:0;border-radius:50%;
+  background:#1687f5;color:#fff;font-size:30px;font-weight:900;
+  display:flex;align-items:center;justify-content:center;
+  flex:0 0 auto;
+}
+.send:active{transform:scale(.96)}
+.userbox{display:none}
+
+.hero{
+  position:relative!important;
+  padding-left:132px!important;
+  box-sizing:border-box!important;
+}
+.hero-logo{
+  position:absolute!important;
+  left:18px!important;
+  top:50%!important;
+  transform:translateY(-50%)!important;
+  width:88px!important;
+  height:88px!important;
+  border-radius:50%!important;
+  z-index:5!important;
+}
+.hero h1,
+.hero p{
+  margin-left:0!important;
+  padding-left:0!important;
+  max-width:100%!important;
+}
+
+.qty-wrap{display:flex;align-items:center;gap:10px;margin-top:14px;}
+.qty-btn{width:38px;height:38px;border:none;border-radius:12px;background:#1688f8;color:#fff;font-size:24px;font-weight:900;}
+.qty-num{min-width:70px;text-align:center;font-size:17px;font-weight:800;color:#111;}
+
+.to-cart-btn{margin-top:12px;width:100%;height:46px;border:0;border-radius:16px;background:#111;color:#fff;font-size:17px;font-weight:900;}
+
+.cart-modal{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:99999;display:flex;align-items:flex-end;}
+.cart-panel{width:100%;max-height:82vh;overflow:auto;background:#fff;border-radius:28px 28px 0 0;padding:22px;box-sizing:border-box;}
+.cart-title{font-size:30px;font-weight:900;margin-bottom:14px;color:#111;}
+.cart-item{background:#f3f5f8;border-radius:20px;padding:16px;margin-bottom:12px;}
+.cart-name{font-size:16px;font-weight:800;color:#17181c;line-height:1.3;margin-bottom:8px;}
+.cart-price{font-size:16px;color:#7b8494;margin-bottom:12px;}
+.cart-line{display:flex;align-items:center;justify-content:space-between;gap:10px;}
+.cart-remove{border:0;background:#fff;color:#e53935;border-radius:14px;padding:10px 12px;font-weight:900;}
+.cart-empty{background:#f3f5f8;border-radius:20px;padding:18px;color:#7b8494;font-size:17px;}
+.cart-close,.cart-submit{width:100%;height:54px;border:0;border-radius:18px;font-size:18px;font-weight:900;margin-top:10px;}
+.cart-submit{background:#1688f8;color:#fff;}
+.cart-close{background:#eef0f3;color:#111;}
+
+.checkout-field{width:100%;box-sizing:border-box;border:1px solid #dde3ea;border-radius:16px;padding:14px 16px;font-size:17px;margin-top:10px;}
+.checkout-label{font-size:15px;font-weight:900;color:#6f7785;margin-top:14px;}
+.checkout-total{background:#111;color:#fff;border-radius:18px;padding:16px;margin:14px 0;font-size:20px;font-weight:900;}
+.checkout-choice{display:flex;gap:10px;margin-top:10px;}
+.checkout-choice button{flex:1;height:46px;border:0;border-radius:16px;background:#eef0f3;color:#111;font-size:16px;font-weight:900;}
+.checkout-choice button.active{background:#1688f8;color:#fff;}
+
+.cart-panel{width:100%;max-height:88vh;overflow:auto;background:#fff;border-radius:30px 30px 0 0;padding:22px 18px;box-sizing:border-box;}
+.cart-title{font-size:28px;font-weight:700;margin-bottom:4px;color:#4f5663;text-align:center;}
+.cart-subtitle{font-size:15px;color:#7b8494;text-align:center;margin-bottom:18px;}
+.cart-item{display:grid;grid-template-columns:82px 1fr auto;gap:14px;align-items:center;background:#fff;border-radius:0;padding:14px 0;margin-bottom:0;border-bottom:1px solid #edf0f3;}
+.cart-img{width:82px;height:82px;border-radius:20px;object-fit:cover;background:#f3f5f8;}
+.cart-img-placeholder{width:82px;height:82px;border-radius:20px;background:#f3f5f8;display:flex;align-items:center;justify-content:center;font-size:28px;}
+.cart-name{font-size:16px;font-weight:700;color:#555e6d;line-height:1.3;margin-bottom:8px;}
+.cart-price{font-size:15px;color:#777;margin-bottom:10px;}
+.cart-line{display:flex;align-items:center;gap:8px;justify-content:flex-start;}
+.cart-line .qty-btn{width:34px;height:34px;border-radius:12px;background:#f4f4f6;color:#202124;font-size:22px;}
+.cart-line .qty-num{min-width:58px;font-size:15px;font-weight:800;}
+.cart-remove{width:34px;height:34px;border:0;background:#f4f4f6;color:#222;border-radius:12px;font-weight:900;font-size:17px;padding:0;}
+.cart-total-line{font-size:17px;font-weight:800;color:#17181c;white-space:nowrap;align-self:center;}
+.cart-summary{background:#111;color:#fff;border-radius:22px;padding:16px;margin:18px 0 10px;font-size:20px;font-weight:900;text-align:center;}
+
+/* final typography override */
+.title{
+  color:#596170!important;
+  font-weight:700!important;
+}
+.desc{
+  color:#8a93a3!important;
+}
+.name{
+  color:#17181c!important;
+  font-weight:800!important;
+}
+.price{
+  color:#17181c!important;
+  font-weight:800!important;
+}
+.cart-name{
+  color:#17181c!important;
+  font-weight:800!important;
+}
+.cart-total-line{
+  color:#17181c!important;
+  font-weight:800!important;
+}
+
+/* FINAL COLORS */
+.title{
+  color:#596170!important;
+  font-weight:700!important;
+}
+.desc{
+  color:#8a93a3!important;
+}
+.name{
+  color:#17181c!important;
+  font-weight:800!important;
+}
+.price{
+  color:#17181c!important;
+  font-weight:800!important;
+}
+.cart-name{
+  color:#17181c!important;
+  font-weight:800!important;
+}
+.cart-total-line{
+  color:#17181c!important;
+  font-weight:800!important;
+}
+
+
+.subcats-grid{
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:12px;
+  padding:0 16px 120px;
+}
+
+.subcat{
+  min-height:145px;
+  border:0;
+  border-radius:24px;
+  background:#fff;
+  box-shadow:0 12px 30px rgba(20,25,35,.07);
+  padding:16px;
+  text-align:left;
+}
+
+.subcat .icon{
+  width:54px;
+  height:54px;
+  border-radius:18px;
+  background:#f4f5f7;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:26px;
+  margin-bottom:16px;
+}
+
+.subcat .title{
+  font-size:22px;
+  line-height:1.12;
+  font-weight:900;
+  color:#596170;
+  margin-bottom:8px;
+}
+
+.subcat .desc{
+  font-size:15px;
+  line-height:1.25;
+  color:#8a92a1;
+}
+
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <button class="close" onclick="closeApp()">×</button>
+    <div class="header-title">Alex Kitchen | Обсуждение</div>
+    <button class="menu">···</button>
+  </div>
+
+  <div class="toolbar">
+    <div class="pill"><span id="count">0</span> комментариев</div>
+  </div>
+
+  <div class="day">Сегодня</div>
+
+  <div class="chat" id="comments"></div>
+
+  <div class="composer">
+    <button class="attach">⌘</button>
+    <textarea id="text" class="input" placeholder="Сообщение" rows="1"></textarea>
+    <button class="send" onclick="sendComment()">↑</button>
+  </div>
+</div>
+
+<script>
+let postID = "{{.PostID}}";
+let maxUser = {
+  user_id: "",
+  name: "Пользователь MAX",
+  username: "",
+  photo_url: ""
+};
+
+function readStartParam(){
+  try{
+    const wa = window.WebApp || null;
+    const p = wa && wa.initDataUnsafe ? wa.initDataUnsafe.start_param : "";
+    if(p) postID = String(p);
+  }catch(e){}
+}
+
+function readMaxUser(){
+  try{
+    const wa = window.WebApp || null;
+    if(!wa) return;
+
+    const u = wa.initDataUnsafe && wa.initDataUnsafe.user ? wa.initDataUnsafe.user : null;
+    if(!u) return;
+
+    const first = u.first_name || "";
+    const last = u.last_name || "";
+    const full = [first,last].filter(Boolean).join(" ");
+
+    maxUser = {
+      user_id: String(u.id || ""),
+      name: full || u.username || "Пользователь MAX",
+      username: u.username || "",
+      photo_url: u.photo_url || ""
+    };
+
+    if(wa.ready) wa.ready();
+    if(wa.expand) wa.expand();
+  }catch(e){}
+}
+
+function closeApp(){
+  try{
+    if(window.WebApp && window.WebApp.close) window.WebApp.close();
+  }catch(e){}
+}
+
+async function loadComments(){
+  const res = await fetch("/api/comments?post=" + encodeURIComponent(postID));
+  const data = await res.json();
+  const box = document.getElementById("comments");
+  const count = document.getElementById("count");
+
+  count.innerText = data ? data.length : 0;
+
+  if(!data || data.length === 0){
+    box.innerHTML = '<div class="empty">Пока нет комментариев.<br>Будьте первым.</div>';
+    return;
+  }
+
+  let html = "";
+  for(const c of data){
+    const avatar = initials(c.name);
+    html += '<div class="row">';
+    html += '<div class="avatar">' + avatar + '</div>';
+    html += '<div class="bubble">';
+    html += '<div class="name">' + escapeHtml(c.name) + '</div>';
+    html += '<div class="text">' + escapeHtml(c.text) + '</div>';
+    html += '<div class="time">' + escapeHtml(c.created_at || "") + '</div>';
+    html += '</div>';
+    html += '</div>';
+  }
+
+  box.innerHTML = html;
+  box.scrollTop = box.scrollHeight;
+}
+
+async function sendComment(){
+  const input = document.getElementById("text");
+  const text = input.value.trim();
+
+  if(!text){
+    return;
+  }
+
+  await fetch("/api/comments/add", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({
+      post_id: postID,
+      user_id: maxUser.user_id,
+      name: maxUser.name,
+      username: maxUser.username,
+      text: text
+    })
+  });
+
+  input.value = "";
+  input.style.height = "44px";
+  await loadComments();
+
+  try{
+    if(window.WebApp && window.WebApp.HapticFeedback){
+      window.WebApp.HapticFeedback.notificationOccurred("success");
+    }
+  }catch(e){}
+}
+
+function initials(name){
+  const s = String(name || "П").trim();
+  return escapeHtml(s.slice(0,1).toUpperCase());
+}
+
+function escapeHtml(s){
+  return String(s || "").replace(/[&<>"']/g,function(m){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m];
+  });
+}
+
+const input = document.getElementById("text");
+input.addEventListener("input", function(){
+  this.style.height = "44px";
+  this.style.height = Math.min(this.scrollHeight,110) + "px";
+});
+
+input.addEventListener("keydown", function(e){
+  if(e.key === "Enter" && !e.shiftKey){
+    e.preventDefault();
+    sendComment();
+  }
+});
+
+readStartParam();
+readMaxUser();
+loadComments();
+setInterval(loadComments,5000);
+</script>
+</body>
+</html>`
+
+const shopHTML = `<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>proМясо</title>
+<script src="https://st.max.ru/js/max-web-app.js"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;color:#111}
+.app{max-width:520px;margin:0 auto;min-height:100vh;background:#f4f5f7;padding-bottom:120px}
+
+.hero{position:sticky;top:0;z-index:50;background:rgba(255,255,255,.94);backdrop-filter:blur(16px);padding:16px 18px 18px;border-bottom:1px solid rgba(0,0,0,.05)}
+.hero-top{display:flex;align-items:center;gap:14px}
+.hero-logo{width:72px;height:72px;border-radius:24px;object-fit:cover;box-shadow:0 8px 24px rgba(0,0,0,.14);flex-shrink:0;background:#fff}
+.hero h1{margin:0;font-size:30px;font-weight:900;letter-spacing:-.04em;color:#111}
+.hero p{margin:4px 0 0;color:#6d7380;font-size:14px;line-height:1.35}
+.search-wrap{margin-top:16px}
+.search{width:100%;height:52px;border:0;border-radius:18px;background:#eceff3;padding:0 18px;font-size:16px;box-sizing:border-box;outline:none}
+
+.banner{margin:14px 18px 18px;border-radius:24px;overflow:hidden;background:linear-gradient(135deg,#111,#3b1b13);color:#fff;padding:18px;position:relative;box-shadow:0 8px 28px rgba(0,0,0,.14)}
+.banner-title{font-size:22px;font-weight:900;line-height:1.1;margin-bottom:8px;max-width:300px;letter-spacing:-.035em}
+.banner-text{color:rgba(255,255,255,.78);font-size:13px;line-height:1.4;max-width:320px}
+.banner-chip{display:inline-flex;align-items:center;gap:8px;background:rgba(255,255,255,.14);border-radius:999px;padding:8px 12px;margin-top:12px;font-size:13px;font-weight:800}
+
+.about-block{
+  margin:18px;
+  background:#fff;
+  border-radius:24px;
+  padding:18px;
+  box-shadow:0 6px 20px rgba(0,0,0,.06)
+}
+.about-title{
+  font-size:24px;
+  font-weight:800;
+  margin-bottom:14px
+}
+.about-text{
+  color:#555;
+  line-height:1.6;
+  font-size:15px
+}
+.about-schedule{
+  margin-top:14px;
+  background:#f5f5f5;
+  border-radius:14px;
+  padding:12px;
+  font-weight:700
+}
+.delivery-block{
+  margin:18px;
+  background:#fff;
+  border-radius:24px;
+  padding:18px;
+  box-shadow:0 6px 20px rgba(0,0,0,.06)
+}
+
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:0 18px 120px}
+.grid::-webkit-scrollbar{display:none}
+.cat{width:100%;min-height:164px;border:0;border-radius:26px;background:#fff;padding:18px;text-align:left;box-shadow:0 8px 28px rgba(0,0,0,.06)}
+.icon{width:56px;height:56px;border-radius:18px;display:flex;align-items:center;justify-content:center;background:#f4f5f7;font-size:28px;margin-bottom:14px}
+.title{font-size:18px;font-weight:900;line-height:1.2}
+.desc{font-size:12px;color:#8a93a3;margin-top:8px;line-height:1.35;}
+
+.topbar{position:sticky;top:0;z-index:60;background:rgba(244,245,247,.92);backdrop-filter:blur(16px);display:flex;align-items:center;gap:10px;padding:14px 18px;margin:0 -14px 14px}
+.back{border:0;background:#fff;border-radius:16px;padding:11px 14px;font-size:16px;font-weight:900;box-shadow:0 4px 12px rgba(0,0,0,.07)}
+.section{font-size:22px;font-weight:900;letter-spacing:-.03em}
+
+.products{padding:0 18px 120px}
+.product-img{width:100%;height:220px;object-fit:cover;border-radius:24px;display:block;margin-bottom:16px}
+.card{background:#fff;border-radius:30px;padding:18px;margin-bottom:18px;box-shadow:0 10px 32px rgba(0,0,0,.06)}
+.name{font-size:22px;font-weight:900;line-height:1.15;letter-spacing:-.03em}
+.note{margin-top:8px;color:#6d7380;font-size:14px;line-height:1.45}
+.row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px}
+.price{font-size:24px;font-weight:900;letter-spacing:-.03em;color:#111}
+
+.qty-wrap{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:16px}
+.qty-btn{width:44px;height:44px;border:0;border-radius:16px;background:#f1f3f6;color:#111;font-size:24px;font-weight:900}
+.qty-num{min-width:92px;text-align:center;font-size:18px;font-weight:900;color:#111}
+.to-cart-btn{width:100%;height:56px;border:0;border-radius:20px;background:#111;color:#fff;font-size:17px;font-weight:900;margin-top:18px}
+
+.bottom{position:fixed;left:0;right:0;bottom:0;z-index:100;padding:14px 16px calc(env(safe-area-inset-bottom) + 14px);background:rgba(255,255,255,.94);backdrop-filter:blur(20px);border-top:1px solid rgba(0,0,0,.06)}
+.cart{width:100%;height:58px;border:0;border-radius:22px;background:#111;color:#fff;font-size:18px;font-weight:900;box-shadow:0 10px 28px rgba(0,0,0,.18)}
+.hidden{display:none}
+
+.cart-modal{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:99999;display:flex;align-items:flex-end}
+.cart-panel{width:100%;max-height:82vh;overflow:auto;background:#fff;border-radius:28px 28px 0 0;padding:22px;box-sizing:border-box}
+.cart-title{font-size:30px;font-weight:900;margin-bottom:14px;color:#111}
+.cart-item{background:#f3f5f8;border-radius:20px;padding:16px;margin-bottom:12px}
+.cart-name{font-size:20px;font-weight:900;color:#111;margin-bottom:6px}
+.cart-price{font-size:16px;color:#7b8494;margin-bottom:12px}
+.cart-line{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.cart-remove{border:0;background:#fff;color:#e53935;border-radius:14px;padding:10px 12px;font-weight:900}
+.cart-empty{background:#f3f5f8;border-radius:20px;padding:18px;color:#7b8494;font-size:17px}
+.cart-close,.cart-submit{width:100%;height:54px;border:0;border-radius:18px;font-size:18px;font-weight:900;margin-top:10px}
+.cart-submit{background:#1688f8;color:#fff}
+.cart-close{background:#eef0f3;color:#111}
+
+.checkout-field{width:100%;box-sizing:border-box;border:1px solid #dde3ea;border-radius:16px;padding:14px 16px;font-size:17px;margin-top:10px}
+.checkout-label{font-size:15px;font-weight:900;color:#6f7785;margin-top:14px}
+.checkout-total{background:#111;color:#fff;border-radius:18px;padding:16px;margin:14px 0;font-size:20px;font-weight:900}
+.checkout-choice{display:flex;gap:10px;margin-top:10px}
+.checkout-choice button{flex:1;height:46px;border:0;border-radius:16px;background:#eef0f3;color:#111;font-size:16px;font-weight:900}
+.checkout-choice button.active{background:#1688f8;color:#fff}
+
+.cart-panel{width:100%;max-height:88vh;overflow:auto;background:#fff;border-radius:30px 30px 0 0;padding:22px 18px;box-sizing:border-box;}
+.cart-title{font-size:28px;font-weight:700;margin-bottom:4px;color:#4f5663;text-align:center;}
+.cart-subtitle{font-size:15px;color:#7b8494;text-align:center;margin-bottom:18px;}
+.cart-item{display:grid;grid-template-columns:82px 1fr auto;gap:14px;align-items:center;background:#fff;border-radius:0;padding:14px 0;margin-bottom:0;border-bottom:1px solid #edf0f3;}
+.cart-img{width:82px;height:82px;border-radius:20px;object-fit:cover;background:#f3f5f8;}
+.cart-img-placeholder{width:82px;height:82px;border-radius:20px;background:#f3f5f8;display:flex;align-items:center;justify-content:center;font-size:28px;}
+.cart-name{font-size:16px;font-weight:700;color:#555e6d;line-height:1.3;margin-bottom:8px;}
+.cart-price{font-size:15px;color:#777;margin-bottom:10px;}
+.cart-line{display:flex;align-items:center;gap:8px;justify-content:flex-start;}
+.cart-line .qty-btn{width:34px;height:34px;border-radius:12px;background:#f4f4f6;color:#202124;font-size:22px;}
+.cart-line .qty-num{min-width:58px;font-size:15px;font-weight:800;}
+.cart-remove{width:34px;height:34px;border:0;background:#f4f4f6;color:#222;border-radius:12px;font-weight:900;font-size:17px;padding:0;}
+.cart-total-line{font-size:17px;font-weight:700;color:#5f6775;white-space:nowrap;align-self:center;}
+.cart-summary{background:#111;color:#fff;border-radius:22px;padding:16px;margin:18px 0 10px;font-size:20px;font-weight:900;text-align:center;}
+
+/* soft mobile text override */
+.title{
+  color:#555e6d!important;
+  font-weight:700!important;
+  line-height:1.22!important;
+}
+.name{
+  color:#555e6d!important;
+  font-weight:700!important;
+}
+.price{
+  color:#5f6775!important;
+  font-weight:700!important;
+}
+.section{
+  color:#4f5663!important;
+  font-weight:700!important;
+}
+.cart-name{
+  color:#555e6d!important;
+  font-weight:700!important;
+}
+.cart-total-line{
+  color:#5f6775!important;
+  font-weight:700!important;
+}
+
+/* SHOP FINAL COLORS */
+.title{
+  color:#596170!important;
+  font-weight:700!important;
+}
+.desc{
+  color:#8a93a3!important;
+}
+.name{
+  color:#17181c!important;
+  font-weight:800!important;
+}
+.price{
+  color:#17181c!important;
+  font-weight:800!important;
+}
+.cart-name{
+  color:#17181c!important;
+  font-weight:800!important;
+}
+.cart-total-line{
+  color:#17181c!important;
+  font-weight:800!important;
+}
+
+
+.subcats-grid{
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:12px;
+  padding:0 16px 120px;
+}
+
+.subcat{
+  min-height:145px;
+  border:0;
+  border-radius:24px;
+  background:#fff;
+  box-shadow:0 12px 30px rgba(20,25,35,.07);
+  padding:16px;
+  text-align:left;
+}
+
+.subcat .icon{
+  width:54px;
+  height:54px;
+  border-radius:18px;
+  background:#f4f5f7;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:26px;
+  margin-bottom:16px;
+}
+
+.subcat .title{
+  font-size:22px;
+  line-height:1.12;
+  font-weight:900;
+  color:#596170;
+  margin-bottom:8px;
+}
+
+.subcat .desc{
+  font-size:15px;
+  line-height:1.25;
+  color:#8a92a1;
+}
+
+</style>
+</head>
+<body>
+<div class="app">
+  <div id="home">
+    <div class="hero">
+      <div class="hero-top">
+        <img class="hero-logo" src="/static/products/alex-kitchen-logo.png?v=2" alt="Alex Kitchen">
+        <div>
+          <h1>proМясо 2.0</h1>
+          <p>Настоящие гастрономические приключения начинаются тут.</p>
+        </div>
+      </div>
+      </div>
+
+    <div class="banner">
+      <div class="banner-title">Свежайшее мясо и фермерские деликатесы</div>
+      <div class="banner-text">
+        Частный мясной цех Alex Kitchen / proМясо.<br>
+        Свежая продукция напрямую с производства.
+      </div>
+
+      <div style="margin-top:18px;padding-top:16px;border-top:1px solid rgba(255,255,255,.12);">
+    <div style="display:flex;flex-direction:column;gap:10px;font-size:16px;font-weight:400;line-height:1.4;">
+      <div>🚚 Доставка по Ногинску, Электростали и Черноголовке</div>
+      <div>📍 Пункты выдачи в наших заведениях</div>
+      <div>⭐ Продукция напрямую от производителя</div>
+    </div>
+  </div>
+    </div>
+
+    <div class="grid" id="categories"></div>
+  </div>
+
+  <div id="categoryView" class="hidden">
+    <div class="topbar">
+      <button class="back" onclick="showHome()">← Назад</button>
+      <div class="section" id="categoryTitle"></div>
+    </div>
+    <div class="products" id="products"></div>
+  </div>
+</div>
+
+
+<div class="bottom">
+  <button class="cart" id="cartBtn" onclick="openCart()">🛒 Корзина пока пуста</button>
+</div>
+
+<script>
+const categories = [
+  {
+    id:"vk",
+    icon:"🥩",
+    title:"Мясные деликатесы ВК",
+    desc:"Фирменные позиции",
+    items:[
+      ["Окорок Альпийский","975 ₽/кг","Нежные ломтики свинины с ароматом дымка и специй","/static/products/okorok.png"],
+      ["Буженина Домашняя","1280 ₽/кг","Сочная буженина с пряностями и чесноком","/static/products/buzhenina.png"],
+      ["Шея Яблочно-имбирная","1370 ₽/кг","Свиная шея с яблоком и имбирём","/static/products/sheya.png"],
+      ["Карбонат Медовый","1130 ₽/кг","Карбонат в медовой глазури","/static/products/karbonat.png"],
+      ["Грудинка Цыганская","890 ₽/кг","Грудинка с пряностями и чесноком","/static/products/grudinka.png"],
+      ["Орех Ветчинный Мускат","940 ₽/кг","Деликатес из свинины с мускатным ароматом","/static/products/oreh.png"],
+      ["Курица Голден","595 ₽/кг","Куриное мясо с ароматом дымка","/static/products/kurochka.png"],
+      ["Перепёлка Дичь","300 ₽/шт","Перепёлка варёно-копчёная","/static/products/perepelka-dich.png?v=5"]
+    ]
+  },
+  {
+    id:"dry",
+    icon:"🥓",
+    title:"Сыровяленые деликатесы",
+    desc:"Вяленое мясо",
+    items:[
+      ["Коппа СВ","370 ₽/50 г","Вызревание от 180 дней","/static/products/coppa-180.png"],
+      ["Хамон СК","360 ₽/100 г","Вызревание от 120 дней","/static/products/hamon-120.png"],
+      ["Бекон СС нежный","930 ₽/кг","Нарезка","/static/products/bekon-ss-nezhnyy.png"]
+    ]
+  },
+  {
+    id:"beer",
+    icon:"🍺",
+    title:"Деликатесы к пенному",
+    desc:"Закуски",
+    items:[
+      ["Уши свиные","860 ₽/кг","Копчёные свиные ушки — идеальная закуска к пенному","/static/products/ushi.png"],
+      ["Рулька ВК по-баварски","790 ₽/кг","Сочная свиная рулька с аппетитной корочкой","/static/products/rulka.png"],
+      ["Слайсы Кабан","260 ₽/100 г","Закуска к пенному"],
+      ["Слайсы Дичь","290 ₽/100 г","Закуска к пенному"]
+    ]
+  },
+  {
+    id:"semi",
+    icon:"🥟",
+    title:"Полуфабрикаты",
+    desc:"Быстро приготовить",
+    items:[
+      ["Скоро добавим позиции","—","Раздел подготовлен под прайс"]
+    ]
+  },
+  {
+    id:"grill",
+    icon:"🍳",
+    title:"Для сковороды и гриля",
+    desc:"Стейки, шашлык, гриль",
+    items:[
+      ["Купаты классические свинина","550 ₽/кг","Для жарки и гриля","/static/products/kupaty-classic.png"],
+      ["Купаты классические курица","600 ₽/кг","Для жарки и гриля","/static/products/kupaty-classic-chicken.png"],
+      ["Купаты шашлычные свинина","550 ₽/кг","Для жарки и гриля","/static/products/kupaty-shashlychnye.png"],
+      ["Шашлык Рождённый в СССР","460 ₽/кг","Свинина микс","/static/products/shashlyk-ussr.png"],
+      ["Шашлык Кавказский","460 ₽/кг","Свинина микс","/static/products/shashlyk-kavkaz.png"],
+      ["Шашлык Клюква/Киви","830 ₽/кг","Свиная шея","/static/products/shashlyk-kiwi-cranberry.png"],
+      ["Шашлык Куриный","430 ₽/кг","Куриный микс","/static/products/shashlyk-kurinyy.png"]
+    ]
+  },
+  {
+    id:"farm",
+    icon:"🚜",
+    title:"Фермерское мясо",
+    desc:"Свинина, говядина, курица, птица",
+    subcategories:[
+      {
+        id:"farm-pork",
+        icon:"🐖",
+        title:"Свинина",
+        desc:"Окорок, грудинка, шея, вырезка",
+        items:[
+          ["Окорок свиной","422 ₽/кг","Свинина","/static/products/okorok-svezh.png?v=2"],
+          ["Грудинка свиная","443 ₽/кг","Свинина","/static/products/grudinka-svezh.png"],
+          ["Лопатка свиная","422 ₽/кг","Свинина","/static/products/lopatka.png"],
+          ["Шея свиная","631 ₽/кг","Свинина","/static/products/sheya-svezh.png"],
+          ["Вырезка свиная","681 ₽/кг","Свинина","/static/products/vyrezka.png"],
+          ["Карбонад","543 ₽/кг","Свинина","/static/products/karbonat-svezh.png"],
+          ["Корейка","531 ₽/кг","Свинина","/static/products/koreyka-svezh.png"],
+          ["Свиной задок","234 ₽/кг","Свинина","/static/products/zadok-svezh.png"]
+        ]
+      },
+      {
+        id:"farm-beef",
+        icon:"🐄",
+        title:"Говядина",
+        desc:"Отрубы, рёбрышки, косточки",
+        items:[
+          ["Шейный отруб","956 ₽/кг","Говядина","/static/products/sheynyy-otrub.png"],
+          ["Толстый край","1031 ₽/кг","Говядина","/static/products/tolstyy-kray.png"],
+          ["Лопатка говяжья","956 ₽/кг","Говядина","/static/products/lopatka-govyazhya.png"],
+          ["Ребрышки","731 ₽/кг","Говядина","/static/products/rebra.png"],
+          ["Тазобедренный","956 ₽/кг","Говядина","/static/products/tazobedrennyy-otrub.png"],
+          ["Мозговые косточки","290 ₽/кг","Говядина","/static/products/mozgovye-kostochki.png"]
+        ]
+      },
+      {
+        id:"farm-chicken",
+        icon:"🐔",
+        title:"Курица",
+        desc:"Бедро, крыло, голень, филе",
+        items:[
+          ["Бедро куриное","268 ₽/кг","Курица","/static/products/bedro-kurinoe.png"],
+          ["Крыло куриное","363 ₽/кг","Курица","/static/products/krilo-kurinoe.png"],
+          ["Голень куриная","306 ₽/кг","Курица","/static/products/golen-kurinaya.png"],
+          ["Филе ЦБ","458 ₽/кг","Курица","/static/products/file-cb.png"],
+          ["Окорочок","293 ₽/кг","Курица","/static/products/okorochok.png"],
+          ["Курочка тушка","254 ₽/кг","Курица","/static/products/kurochka-tushka.png"],
+          ["Грудка на кости","395 ₽/кг","Курица","/static/products/grudka-na-kosti.png"]
+        ]
+      },
+      {
+        id:"farm-bird",
+        icon:"🦃",
+        title:"Индейка / Утка / Перепёлка",
+        desc:"Индейка, утка, перепёлка",
+        items:[
+          ["Голень индейки","349 ₽/кг","Индейка","/static/products/golen-indeiki.png"],
+          ["Утка тушка","528 ₽/кг","Утка","/static/products/utka-tushka.png"],
+          ["Филе грудки индейки","749 ₽/кг","Индейка","/static/products/file-indeiki.png"],
+          ["Утиные окорочка","829 ₽/кг","Утка","/static/products/utinye-okorochka.png"],
+          ["Филе бедра индейки","756 ₽/кг","Индейка","/static/products/file-bedra-indeiki.png"],
+          ["Перепёлка","249 ₽/шт","Птица","/static/products/perepelka-farm.png?v=1"]
+        ]
+      }
+    ]
+  },
+  {
+    id:"broth",
+    icon:"🍲",
+    title:"Полезные бульоны",
+    desc:"Домашние бульоны",
+    items:[
+      ["Скоро добавим позиции","—","Раздел подготовлен под прайс"]
+    ]
+  },
+  {
+    id:"drinks",
+    icon:"🥤",
+    title:"Квас и медовуха",
+    desc:"Напитки в розлив",
+    items:[
+      ["Квас в розлив","1л — 200 ₽ / 5л — 400 ₽","Настоящий живой квас с хлебным ароматом и лёгкой кислинкой","/static/products/kvas.png"],
+      ["Медовуха в розлив","1л — 350 ₽ / 5л — 1500 ₽","Тёплый аромат мёда, лёгкая сладость и натуральное послевкусие","/static/products/medovuha.png"]
+    ]
+  },
+  {
+    id:"business",
+    icon:"🥩",
+    title:"Мясо для бизнеса",
+    desc:"Рваное мясо Low & Slow для фастфуда и HoReCa",
+    content:"<div class=\"name\">🥩 Мясо для бизнеса</div><div class=\"note\" style=\"font-size:16px;line-height:1.6;margin-top:14px;\"><b>Быстро, вкусно и удобно — решение для вашего бизнеса.</b><br><br>Рваное мясо <b>Low & Slow</b> из свинины, телятины и куриной грудки — готовое решение для фастфуда, кафе, ресторанов и магазинов.<br><br><b>🎯 Подходит для:</b><br>шаурмы, донера, кебаба, бургеров, сэндвичей, хот-догов и других блюд.<br><br><b>✅ Преимущества:</b><br>• готово к использованию<br>• быстро разогревается и поджаривается<br>• не требует сложного оборудования<br>• сокращает время приготовления<br>• увеличивает скорость обслуживания клиентов<br>• помогает расширить меню и увеличить прибыль<br><br><b>🤝 Для партнёров:</b><br>• обучение персонала<br>• консультации по запуску меню<br>• поддержка на старте<br>• оборудование на специальных условиях<br><br><b>💰 Стоимость</b><br>Цены рассчитываются индивидуально и зависят от объёма закупки.<br><br>📧 Запросить оптовый прайс: <b>89067550075@mail.ru</b><br>📞 Телефон: <b>8 (906) 755-00-75</b></div><a href=\"mailto:89067550075@mail.ru?subject=Запрос оптового прайса Alex Kitchen\" style=\"display:block;margin-top:18px;background:#111;color:#fff;text-align:center;text-decoration:none;border-radius:16px;padding:15px;font-size:16px;font-weight:800;\">Запросить оптовый прайс</a>"
+  },
+  {
+    id:"location",
+    icon:"📍",
+    title:"Где мы находимся",
+    desc:"Адрес и карта",
+    content:"<div class=\"name\">📍 Где мы находимся</div><div class=\"note\" style=\"font-size:16px;line-height:1.7;margin-top:14px;\"><b>Частный мясной цех proМясо</b><br><br>Московская область,<br>Богородский городской округ.<br><br>Мясная продукция оптом и в розницу. Самовывоз с производства по предварительному заказу.</div><div style=\"margin-top:18px;border-radius:20px;overflow:hidden;background:#f5f5f5;height:260px;\"><iframe src=\"https://yandex.ru/map-widget/v1/?oid=85571061262&ol=biz\" width=\"100%\" height=\"260\" frameborder=\"0\" allowfullscreen=\"true\" style=\"border:0;display:block;\"></iframe></div><a href=\"https://yandex.ru/maps/org/chastny_myasnoy_tsekh/85571061262/\" target=\"_blank\" style=\"display:block;margin-top:18px;background:#e9e9eb;color:#444;text-align:center;text-decoration:none;border-radius:16px;padding:14px;font-size:15px;font-weight:700;border:1px solid #d7d7d9;\">Открыть маршрут в Яндекс Картах</a>"
+  },
+  {
+    id:"info",
+    icon:"ℹ️",
+    title:"Информация",
+    desc:"О цехе и доставка",
+    subcategories:[
+      {
+        id:"info-about",
+        icon:"🥩",
+        title:"О цехе proМясо",
+        desc:"Кто мы и как работаем",
+        content:"\n          <div class=\"name\">🥩 Частный мясной цех proМясо</div>\n          <div class=\"note\" style=\"font-size:16px;line-height:1.6;margin-top:14px;\">\n            Мы — не просто магазин. Мы — частный мясной цех proМясо.<br><br>\n            У нас нет складов и долгих перевозок. Только свежее мясо, разделанное по вашим стандартам.<br><br>\n            Мы открыты для вас! Загляните к нам в цех, чтобы лично убедиться в качестве нашей работы.\n          </div>\n\n          <div style=\"margin-top:18px;background:#f5f5f5;border-radius:16px;padding:14px;font-size:16px;font-weight:800;line-height:1.5;\">\n            📅 Четверг, Пятница, Суббота:<br>\n            11:00 — 19:00\n          </div>\n\n          <div class=\"note\" style=\"font-size:16px;line-height:1.6;margin-top:18px;\">\n            📦 В остальные дни работаем как пункт выдачи заказов. Оформите заказ онлайн и заберите его по договорённости.\n          </div>\n        "
+      },
+      {
+        id:"info-delivery",
+        icon:"🚚",
+        title:"Доставка",
+        desc:"Условия доставки",
+        content:"\n          <div class=\"name\">🚚 Условия доставки</div>\n          <div class=\"note\" style=\"font-size:16px;line-height:1.7;margin-top:14px;\">\n            📍 Зона доставки:<br>\n            Ногинск, Электросталь, Черноголовка.<br><br>\n\n            💰 Фиксированная стоимость:<br>\n            300 ₽.<br><br>\n\n            🎁 Бесплатная доставка:<br>\n            при заказе от 4000 ₽.<br><br>\n\n            Уточняйте возможность доставки в ваш район и оформляйте заказ заранее.\n          </div>\n        "
+      }
+    ]
+  }
+];
+
+let cart = [];
+
+function renderCategories(){
+  const box = document.getElementById("categories");
+  box.innerHTML = "";
+  for(const c of categories){
+    const btn = document.createElement("button");
+    btn.className = "cat";
+    btn.onclick = function(){ openCategory(c.id); };
+    btn.innerHTML =
+      '<div class="icon">' + c.icon + '</div>' +
+      '<div class="title">' + escapeHtml(c.title) + '</div>' +
+      '<div class="desc">' + escapeHtml(c.desc) + '</div>';
+    box.appendChild(btn);
+  }
+}
+
+function openCategory(id){
+  setTimeout(function(){
+    window.scrollTo(0, 0);
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+  }, 0);
+  let c = categories.find(x => x.id === id);
+  let parent = null;
+
+  if(!c){
+    for(const cat of categories){
+      if(cat.subcategories){
+        const sub = cat.subcategories.find(x => x.id === id);
+        if(sub){
+          c = sub;
+          parent = cat;
+          break;
+        }
+      }
+    }
+  }
+
+  if(!c) return;
+
+  document.getElementById("home").classList.add("hidden");
+  document.getElementById("categoryView").classList.remove("hidden");
+  document.getElementById("categoryTitle").textContent = parent ? parent.title + " — " + c.title : c.title;
+
+  const box = document.getElementById("products");
+  box.innerHTML = "";
+
+  if(c.subcategories){
+    box.className = "subcats-grid";
+    for(const sub of c.subcategories){
+      const btn = document.createElement("button");
+      btn.className = "subcat";
+      btn.onclick = function(){ openCategory(sub.id); };
+      btn.innerHTML =
+        '<div class="icon">' + sub.icon + '</div>' +
+        '<div class="title">' + escapeHtml(sub.title) + '</div>' +
+        '<div class="desc">' + escapeHtml(sub.desc) + '</div>';
+      box.appendChild(btn);
+    }
+    return;
+  }
+
+  if(c.content){
+    box.className = "products";
+    const card = document.createElement("div");
+    card.className = "card info-card";
+    card.innerHTML = c.content;
+    box.appendChild(card);
+    return;
+  }
+
+  box.className = "products";
+
+  for(const item of c.items){
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML =
+      (item[3] ? '<img class="product-img" src="' + escapeHtml(item[3]) + '" alt="' + escapeHtml(item[0]) + '">' : '') +
+      '<div class="name">' + escapeHtml(item[0]) + '</div>' +
+      '<div class="note">' + escapeHtml(item[2]) + '</div>' +
+      '<div class="row"><div class="price">' + escapeHtml(item[1]) + '</div></div>' +
+      '<div class="qty-wrap">' +
+        '<button class="qty-btn minus">−</button>' +
+        '<div class="qty-num">' + formatQty(item[1], getStep(item[1])) + '</div>' +
+        '<button class="qty-btn plus">+</button>' +
+      '</div>' +
+      '<button class="to-cart-btn">В корзину</button>';
+
+    let qty = getStep(item[1]);
+    const qtyNode = card.querySelector(".qty-num");
+
+    card.querySelector(".to-cart-btn").onclick = function(){
+      addToCart(item[0], item[1], qty, item[3] || "");
+    };
+
+    card.querySelector(".minus").onclick = function(){
+      const step = getStep(item[1]);
+      qty = Math.max(step, qty - step);
+      qtyNode.textContent = formatQty(item[1], qty);
+    };
+
+    card.querySelector(".plus").onclick = function(){
+      const step = getStep(item[1]);
+      qty += step;
+      qtyNode.textContent = formatQty(item[1], qty);
+    };
+    box.appendChild(card);
+  }
+}
+
+function showHome(){
+  document.getElementById("categoryView").classList.add("hidden");
+  document.getElementById("home").classList.remove("hidden");
+}
+
+function addToCart(name, price, qty, image){
+  if(price === "—") return;
+
+  const existing = cart.find(x => x.name === name && x.price === price);
+  if(existing){
+    existing.qty = Math.round((existing.qty + qty) * 10) / 10;
+  }else{
+    cart.push({name:name, price:price, qty:qty, image:image || ""});
+  }
+
+  updateCart();
+
+  const btn = document.getElementById("cartBtn");
+  btn.textContent = "✅ Добавлено в корзину";
+  setTimeout(updateCart, 700);
+}
+
+function updateCart(){
+  const btn = document.getElementById("cartBtn");
+  const count = cart.length;
+  btn.textContent = count ? "🛒 Корзина: " + count + " поз." : "🛒 Корзина пока пуста";
+}
+
+function openCart(){
+  const old = document.getElementById("cartModal");
+  if(old) old.remove();
+
+  const modal = document.createElement("div");
+  modal.id = "cartModal";
+  modal.className = "cart-modal";
+
+  let html = '<div class="cart-panel">';
+  html += '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px;">';
+  html += '<div class="cart-title" style="margin-bottom:0;">Корзина</div>';
+  html += '<button onclick="closeCart()" style="width:38px;height:38px;border-radius:999px;border:0;background:#f0f0f0;color:#333;font-size:22px;font-weight:800;line-height:1;">×</button>';
+  html += '</div>';
+  html += '<div class="cart-subtitle">' + cart.length + ' товаров</div>';
+
+  if(!cart.length){
+    html += '<div class="cart-empty">Корзина пока пуста. Добавьте товары из каталога.</div>';
+  }else{
+    for(let i=0; i<cart.length; i++){
+      const x = cart[i];
+      const img = x.image
+        ? '<img class="cart-img" src="' + escapeHtml(x.image) + '" alt="' + escapeHtml(x.name) + '">'
+        : '<div class="cart-img-placeholder">🥩</div>';
+
+      html += '<div class="cart-item">';
+      html += img;
+
+      html += '<div>';
+      html += '<div class="cart-name">' + escapeHtml(x.name) + '</div>';
+      html += '<div class="cart-price">' + escapeHtml(x.price) + '</div>';
+      html += '<div class="cart-line">';
+      html += '<button class="cart-remove" onclick="cartRemove(' + i + ')">🗑</button>';
+      html += '<button class="qty-btn" onclick="cartMinus(' + i + ')">−</button>';
+      html += '<div class="qty-num">' + escapeHtml(formatQty(x.price, x.qty)) + '</div>';
+      html += '<button class="qty-btn" onclick="cartPlus(' + i + ')">+</button>';
+      html += '</div>';
+      html += '</div>';
+
+      html += '<div class="cart-total-line">' + escapeHtml(formatMoney(calcLineTotal(x.price, x.qty))) + '</div>';
+
+      html += '</div>';
+    }
+
+    html += '<div class="cart-summary">Итого: ' + escapeHtml(formatMoney(calcCartTotal())) + '</div>';
+  }
+
+  html += '<button class="cart-submit" onclick="sendCartOrder()">Оформить заказ</button>';
+
+  html += '</div>';
+
+  modal.innerHTML = html;
+  document.body.appendChild(modal);
+
+  modal.addEventListener("touchmove", function(e){
+    lastY = e.touches[0].clientY;
+  }, {passive:true});
+
+  modal.addEventListener("touchend", function(){
+    const diff = lastY - startY;
+
+    if(startScrollTop <= 0 && diff > 120){
+      closeCart();
+    }
+  });
+}
+
+function cartPlus(i){
+  const x = cart[i];
+  if(!x) return;
+  const step = getStep(x.price);
+  x.qty = Math.round((x.qty + step) * 10) / 10;
+  updateCart();
+  openCart();
+}
+
+function cartMinus(i){
+  const x = cart[i];
+  if(!x) return;
+  const step = getStep(x.price);
+  x.qty = Math.round((x.qty - step) * 10) / 10;
+  if(x.qty <= 0){
+    cart.splice(i, 1);
+  }
+  updateCart();
+  openCart();
+}
+
+function cartRemove(i){
+  cart.splice(i, 1);
+  updateCart();
+  openCart();
+}
+
+function closeCart(){
+  const modal = document.getElementById("cartModal");
+  if(modal) modal.remove();
+}
+
+function getUnitForPrice(price){
+  price = String(price || "");
+  if(price.includes("1л") || price.includes("5л") || price.includes("/л")) return "л";
+  if(price.includes("/50 г") || price.includes("/100 г")) return "г";
+  if(price.includes("/шт")) return "шт";
+  return "кг";
+}
+
+function parsePrice(price){
+  const m = String(price || "").match(/(\d+)/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+function calcLineTotal(price, qty){
+  const p = String(price || "");
+
+  if(p.includes("1л") || p.includes("5л") || p.includes("/л")){
+    const one = p.match(/1л\s*[—-]\s*(\d+)/);
+    const five = p.match(/5л\s*[—-]\s*(\d+)/);
+
+    const onePrice = one ? parseInt(one[1], 10) : parsePrice(p);
+    const fivePrice = five ? parseInt(five[1], 10) : 0;
+
+    if(fivePrice && qty >= 5){
+      const packs = Math.floor(qty / 5);
+      const rest = qty - packs * 5;
+      return packs * fivePrice + rest * onePrice;
+    }
+
+    return Math.round(onePrice * qty);
+  }
+
+  const rub = parsePrice(price);
+
+  if(p.includes("/кг")) return Math.round(rub * qty);
+  if(p.includes("/100 г")) return Math.round(rub * (qty / 100));
+  if(p.includes("/50 г")) return Math.round(rub * (qty / 50));
+  if(p.includes("/шт")) return Math.round(rub * qty);
+
+  return 0;
+}
+
+function calcCartTotal(){
+  return cart.reduce(function(sum, x){
+    return sum + calcLineTotal(x.price, x.qty);
+  }, 0);
+}
+
+function formatMoney(n){
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, " ") + " ₽";
+}
+
+let receiveType = "Самовывоз";
+
+function setReceiveType(type){
+  receiveType = type;
+  const p = document.getElementById("pickupBtn");
+  const d = document.getElementById("deliveryBtn");
+  if(p && d){
+    p.className = type === "Самовывоз" ? "active" : "";
+    d.className = type === "Доставка" ? "active" : "";
+  }
+}
+
+async function finishOrder(){
+  const name = document.getElementById("clientName").value.trim();
+  const phone = document.getElementById("clientPhone").value.trim();
+  const comment = document.getElementById("clientComment").value.trim();
+
+  if(!name){ alert("Введите имя"); return; }
+  if(!phone){ alert("Введите телефон"); return; }
+
+  const items = cart.map(function(x){
+    return {
+      name: x.name,
+      price: x.price,
+      qty: x.qty,
+      unit: getUnitForPrice(x.price),
+      line: calcLineTotal(x.price, x.qty)
+    };
+  });
+
+  const payload = {
+    name: name,
+    phone: phone,
+    receive: receiveType,
+    comment: comment,
+    total: calcCartTotal(),
+    items: items
+  };
+
+  try{
+    const res = await fetch("/api/order", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    });
+
+    if(!res.ok){
+      const t = await res.text();
+      alert("Не удалось отправить заказ: " + t);
+      return;
+    }
+
+    const data = await res.json();
+    cart = [];
+    updateCart();
+    closeCart();
+    alert("✅ Заказ оформлен! Мы получили ваш заказ и скоро свяжемся с вами.");
+  }catch(e){
+    alert("Ошибка отправки заказа: " + e.message);
+  }
+}
+
+
+
+function sendCartOrder(){
+  if(!cart.length){
+    alert("Корзина пока пуста");
+    return;
+  }
+
+  closeCart();
+
+  const modal = document.createElement("div");
+  modal.id = "cartModal";
+  modal.className = "cart-modal";
+
+  let html = '<div class="cart-panel">';
+  html += '<div class="cart-title">Оформление заказа</div>';
+  html += '<div class="checkout-total">Итого: ' + formatMoney(calcCartTotal()) + '</div>';
+
+  html += '<div class="checkout-label">Ваше имя</div>';
+  html += '<input id="clientName" class="checkout-field" placeholder="Например, Алексей">';
+
+  html += '<div class="checkout-label">Телефон</div>';
+  html += '<input id="clientPhone" class="checkout-field" placeholder="+7..." inputmode="tel">';
+
+  html += '<div class="checkout-label">Получение</div>';
+  html += '<div class="checkout-choice">';
+  html += '<button id="pickupBtn" class="active" onclick="setReceiveType(\'Самовывоз\')">Самовывоз</button>';
+  html += '<button id="deliveryBtn" onclick="setReceiveType(\'Доставка\')">Доставка</button>';
+  html += '</div>';
+
+  html += '<div class="checkout-label">Комментарий</div>';
+  html += '<textarea id="clientComment" class="checkout-field" rows="3" placeholder="Например: заберу вечером, нужен звонок"></textarea>';
+
+  html += '<button class="cart-submit" id="finishOrderBtn" type="button">Подтвердить заказ</button>';
+  html += '<button class="cart-close" onclick="openCart()">Назад в корзину</button>';
+  html += '</div>';
+
+  modal.innerHTML = html;
+  document.body.appendChild(modal);
+
+  const finishBtn = document.getElementById("finishOrderBtn");
+  if(finishBtn){
+    finishBtn.onclick = function(e){
+      if(e){
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      alert("Кнопка подтверждения нажалась");
+      finishOrder();
+      return false;
+    };
+  } else {
+    alert("Кнопка подтверждения не найдена");
+  }
+}
+
+function escapeHtml(s){
+  return String(s || "").replace(/[&<>"']/g,function(m){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m];
+  });
+}
+
+try{
+  if(window.WebApp){
+    window.WebApp.ready();
+    window.WebApp.expand();
+  }
+}catch(e){}
+
+function getStep(price){
+  price = String(price || "");
+
+  if(price.includes("1л") || price.includes("5л") || price.includes("/л")) return 1;
+  if(price.includes("/50 г")) return 50;
+  if(price.includes("/100 г")) return 100;
+  if(price.includes("/шт")) return 1;
+
+  return 0.5;
+}
+
+function formatQty(price, qty){
+  price = String(price || "");
+
+  if(price.includes("1л") || price.includes("5л") || price.includes("/л")){
+    return qty + " л";
+  }
+
+  if(price.includes("/50 г") || price.includes("/100 г")){
+    return qty + " г";
+  }
+
+  if(price.includes("/шт")){
+    return qty + " шт";
+  }
+
+  return qty.toFixed(1).replace(".0","") + " кг";
+}
+
+renderCategories();
+updateCart();
+</script>
+</body>
+</html>`
+
+const appHTML = `<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Alex Kitchen</title>
+<script src="https://st.max.ru/js/max-web-app.js"></script>
+<style>
+body{margin:0;background:#f4f6fa;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}
+.wrap{padding:24px}
+.product-img{width:100%;height:160px;object-fit:cover;border-radius:18px;margin-bottom:10px;display:block;}
+.card{background:#fff;border-radius:22px;padding:22px;box-shadow:0 6px 18px rgba(0,0,0,.08)}
+h1{margin:0 0 8px;font-size:24px}
+p{color:#667085;font-size:16px}
+
+.hero{
+  position:relative!important;
+  padding-left:132px!important;
+  box-sizing:border-box!important;
+}
+.hero-logo{
+  position:absolute!important;
+  left:18px!important;
+  top:50%!important;
+  transform:translateY(-50%)!important;
+  width:88px!important;
+  height:88px!important;
+  border-radius:50%!important;
+  z-index:5!important;
+}
+.hero h1,
+.hero p{
+  margin-left:0!important;
+  padding-left:0!important;
+  max-width:100%!important;
+}
+
+.qty-wrap{display:flex;align-items:center;gap:10px;margin-top:14px;}
+.qty-btn{width:38px;height:38px;border:none;border-radius:12px;background:#1688f8;color:#fff;font-size:24px;font-weight:900;}
+.qty-num{min-width:70px;text-align:center;font-size:17px;font-weight:800;color:#111;}
+
+.to-cart-btn{margin-top:12px;width:100%;height:46px;border:0;border-radius:16px;background:#111;color:#fff;font-size:17px;font-weight:900;}
+
+.cart-modal{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:99999;display:flex;align-items:flex-end;}
+.cart-panel{width:100%;max-height:82vh;overflow:auto;background:#fff;border-radius:28px 28px 0 0;padding:22px;box-sizing:border-box;}
+.cart-title{font-size:30px;font-weight:900;margin-bottom:14px;color:#111;}
+.cart-item{background:#f3f5f8;border-radius:20px;padding:16px;margin-bottom:12px;}
+.cart-name{font-size:20px;font-weight:900;color:#111;margin-bottom:6px;}
+.cart-price{font-size:16px;color:#7b8494;margin-bottom:12px;}
+.cart-line{display:flex;align-items:center;justify-content:space-between;gap:10px;}
+.cart-remove{border:0;background:#fff;color:#e53935;border-radius:14px;padding:10px 12px;font-weight:900;}
+.cart-empty{background:#f3f5f8;border-radius:20px;padding:18px;color:#7b8494;font-size:17px;}
+.cart-close,.cart-submit{width:100%;height:54px;border:0;border-radius:18px;font-size:18px;font-weight:900;margin-top:10px;}
+.cart-submit{background:#1688f8;color:#fff;}
+.cart-close{background:#eef0f3;color:#111;}
+
+.checkout-field{width:100%;box-sizing:border-box;border:1px solid #dde3ea;border-radius:16px;padding:14px 16px;font-size:17px;margin-top:10px;}
+.checkout-label{font-size:15px;font-weight:900;color:#6f7785;margin-top:14px;}
+.checkout-total{background:#111;color:#fff;border-radius:18px;padding:16px;margin:14px 0;font-size:20px;font-weight:900;}
+.checkout-choice{display:flex;gap:10px;margin-top:10px;}
+.checkout-choice button{flex:1;height:46px;border:0;border-radius:16px;background:#eef0f3;color:#111;font-size:16px;font-weight:900;}
+.checkout-choice button.active{background:#1688f8;color:#fff;}
+
+.cart-panel{width:100%;max-height:88vh;overflow:auto;background:#fff;border-radius:30px 30px 0 0;padding:22px 18px;box-sizing:border-box;}
+.cart-title{font-size:28px;font-weight:700;margin-bottom:4px;color:#4f5663;text-align:center;}
+.cart-subtitle{font-size:15px;color:#7b8494;text-align:center;margin-bottom:18px;}
+.cart-item{display:grid;grid-template-columns:82px 1fr auto;gap:14px;align-items:center;background:#fff;border-radius:0;padding:14px 0;margin-bottom:0;border-bottom:1px solid #edf0f3;}
+.cart-img{width:82px;height:82px;border-radius:20px;object-fit:cover;background:#f3f5f8;}
+.cart-img-placeholder{width:82px;height:82px;border-radius:20px;background:#f3f5f8;display:flex;align-items:center;justify-content:center;font-size:28px;}
+.cart-name{font-size:16px;font-weight:700;color:#555e6d;line-height:1.3;margin-bottom:8px;}
+.cart-price{font-size:15px;color:#777;margin-bottom:10px;}
+.cart-line{display:flex;align-items:center;gap:8px;justify-content:flex-start;}
+.cart-line .qty-btn{width:34px;height:34px;border-radius:12px;background:#f4f4f6;color:#202124;font-size:22px;}
+.cart-line .qty-num{min-width:58px;font-size:15px;font-weight:800;}
+.cart-remove{width:34px;height:34px;border:0;background:#f4f4f6;color:#222;border-radius:12px;font-weight:900;font-size:17px;padding:0;}
+.cart-total-line{font-size:17px;font-weight:700;color:#5f6775;white-space:nowrap;align-self:center;}
+.cart-summary{background:#111;color:#fff;border-radius:22px;padding:16px;margin:18px 0 10px;font-size:20px;font-weight:900;text-align:center;}
+
+/* soft mobile text override */
+.title{
+  color:#555e6d!important;
+  font-weight:700!important;
+  line-height:1.22!important;
+}
+.name{
+  color:#555e6d!important;
+  font-weight:700!important;
+}
+.price{
+  color:#5f6775!important;
+  font-weight:700!important;
+}
+.section{
+  color:#4f5663!important;
+  font-weight:700!important;
+}
+.cart-name{
+  color:#555e6d!important;
+  font-weight:700!important;
+}
+.cart-total-line{
+  color:#5f6775!important;
+  font-weight:700!important;
+}
+
+
+.subcats-grid{
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:12px;
+  padding:0 16px 120px;
+}
+
+.subcat{
+  min-height:145px;
+  border:0;
+  border-radius:24px;
+  background:#fff;
+  box-shadow:0 12px 30px rgba(20,25,35,.07);
+  padding:16px;
+  text-align:left;
+}
+
+.subcat .icon{
+  width:54px;
+  height:54px;
+  border-radius:18px;
+  background:#f4f5f7;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:26px;
+  margin-bottom:16px;
+}
+
+.subcat .title{
+  font-size:22px;
+  line-height:1.12;
+  font-weight:900;
+  color:#596170;
+  margin-bottom:8px;
+}
+
+.subcat .desc{
+  font-size:15px;
+  line-height:1.25;
+  color:#8a92a1;
+}
+
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Alex Kitchen</h1>
+    <p>Открываем мини-приложение...</p>
+  </div>
+</div>
+
+<script>
+function go(){
+  try{
+    const wa = window.WebApp || null;
+    if(wa && wa.ready) wa.ready();
+    if(wa && wa.expand) wa.expand();
+
+    let p = "";
+    if(wa && wa.initDataUnsafe && wa.initDataUnsafe.start_param){
+      p = String(wa.initDataUnsafe.start_param);
+    }
+
+    if(!p || p === "shop" || p === "shop_v2" || p === "open_shop"){
+      location.replace("/shop");
+      return;
+    }
+
+    p = p.replace(/^comments_/, "");
+    location.replace("/comments?post=" + encodeURIComponent(p));
+  }catch(e){
+    location.replace("/shop");
+  }
+}
+go();
+</script>
+</body>
+</html>`
+
+type ShopOrderItem struct {
+	Name  string  `json:"name"`
+	Price string  `json:"price"`
+	Qty   float64 `json:"qty"`
+	Unit  string  `json:"unit"`
+	Line  int     `json:"line"`
+}
+
+type ShopOrderRequest struct {
+	Name    string          `json:"name"`
+	Phone   string          `json:"phone"`
+	Receive string          `json:"receive"`
+	Comment string          `json:"comment"`
+	Total   int             `json:"total"`
+	Items   []ShopOrderItem `json:"items"`
+}
+
+func orderHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ShopOrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	req.Phone = strings.TrimSpace(req.Phone)
+	req.Receive = strings.TrimSpace(req.Receive)
+	req.Comment = strings.TrimSpace(req.Comment)
+
+	if req.Name == "" || req.Phone == "" || len(req.Items) == 0 {
+		http.Error(w, "name, phone and items are required", http.StatusBadRequest)
+		return
+	}
+
+	orderID := time.Now().Format("20060102-150405")
+
+	var b strings.Builder
+	b.WriteString("🛒 Новый заказ из mini-app\n")
+	b.WriteString("№ " + orderID + "\n\n")
+	b.WriteString("👤 Имя: " + req.Name + "\n")
+	b.WriteString("📞 Телефон: " + req.Phone + "\n")
+	b.WriteString("🚚 Получение: " + req.Receive + "\n\n")
+	b.WriteString("🥩 Состав заказа:\n")
+
+	for i, it := range req.Items {
+		b.WriteString(strconv.Itoa(i+1) + ". " + it.Name + " — " + formatQtyServer(it.Qty, it.Unit) + " — " + it.Price)
+		if it.Line > 0 {
+			b.WriteString(" = " + formatRubServer(it.Line))
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n💰 Итого: " + formatRubServer(req.Total) + "\n")
+
+	if req.Comment != "" {
+		b.WriteString("\n💬 Комментарий: " + req.Comment + "\n")
+	}
+
+	if err := sendOrderToMaxAdmins(b.String()); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"ok":true,"order_id":"` + orderID + `"}`))
+}
+
+func formatQtyServer(qty float64, unit string) string {
+	unit = strings.TrimSpace(unit)
+	if unit == "" {
+		unit = "кг"
+	}
+
+	if unit == "кг" {
+		if qty == float64(int(qty)) {
+			return strconv.Itoa(int(qty)) + " кг"
+		}
+		return strings.TrimRight(strings.TrimRight(strconv.FormatFloat(qty, 'f', 1, 64), "0"), ".") + " кг"
+	}
+
+	if qty == float64(int(qty)) {
+		return strconv.Itoa(int(qty)) + " " + unit
+	}
+
+	return strings.TrimRight(strings.TrimRight(strconv.FormatFloat(qty, 'f', 1, 64), "0"), ".") + " " + unit
+}
+
+func formatRubServer(n int) string {
+	return strconv.Itoa(n) + " ₽"
+}
+
+func sendOrderToMaxAdmins(text string) error {
+	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("MAX_BOT_TOKEN"))
+	}
+	if token == "" {
+		return fmt.Errorf("BOT_TOKEN / MAX_BOT_TOKEN is empty")
+	}
+
+	rawAdmins := strings.TrimSpace(os.Getenv("ADMIN_CHAT_IDS"))
+	if rawAdmins == "" {
+		rawAdmins = strings.TrimSpace(os.Getenv("ADMIN_CHAT_ID"))
+	}
+	if rawAdmins == "" {
+		return fmt.Errorf("ADMIN_CHAT_ID / ADMIN_CHAT_IDS is empty")
+	}
+
+	admins := strings.FieldsFunc(rawAdmins, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\t'
+	})
+
+	var lastErr error
+	for _, a := range admins {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+
+		chatID, err := strconv.ParseInt(a, 10, 64)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if err := sendMaxMessage(token, chatID, text); err != nil {
+			lastErr = err
+			continue
+		}
+	}
+
+	return lastErr
+}
+
+func sendMaxMessage(token string, chatID int64, text string) error {
+	body := map[string]any{
+		"text":        text,
+		"attachments": []any{},
+		"notify":      true,
+	}
+
+	data, _ := json.Marshal(body)
+
+	u := "https://platform-api.max.ru/messages?v=1.2.5&chat_id=" + url.QueryEscape(strconv.FormatInt(chatID, 10))
+	httpReq, err := http.NewRequest(http.MethodPost, u, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+
+	httpReq.Header.Set("Authorization", token)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("MAX send failed: status=%d body=%s", resp.StatusCode, string(raw))
+	}
+
+	return nil
+}

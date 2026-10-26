@@ -1,0 +1,283 @@
+package main
+
+import (
+	"encoding/json"
+	"html/template"
+	"log"
+	"net/http"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Comment struct {
+	ID        int64  `json:"id"`
+	PostID    string `json:"post_id"`
+	UserID    string `json:"user_id"`
+	Name      string `json:"name"`
+	Username  string `json:"username"`
+	Text      string `json:"text"`
+	CreatedAt string `json:"created_at"`
+}
+
+type Store struct {
+	mu       sync.Mutex
+	Comments []Comment `json:"comments"`
+}
+
+var storePath = "comments.json"
+var store = Store{}
+var pageTpl = template.Must(template.New("page").Parse(pageHTML))
+
+func loadStore() {
+	data, err := os.ReadFile(storePath)
+	if err != nil {
+		store.Comments = []Comment{}
+		return
+	}
+	_ = json.Unmarshal(data, &store)
+}
+
+func saveStore() error {
+	data, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(storePath, data, 0644)
+}
+
+func commentsPage(w http.ResponseWriter, r *http.Request) {
+	postID := strings.TrimSpace(r.URL.Query().Get("post"))
+	if postID == "" {
+		postID = strings.TrimSpace(r.URL.Query().Get("WebAppStartParam"))
+	}
+	if postID == "" {
+		postID = "waiting"
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = pageTpl.Execute(w, map[string]string{"PostID": postID})
+}
+
+func apiList(w http.ResponseWriter, r *http.Request) {
+	postID := strings.TrimSpace(r.URL.Query().Get("post"))
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	var result []Comment
+	for _, c := range store.Comments {
+		if c.PostID == postID {
+			result = append(result, c)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+func apiAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PostID   string `json:"post_id"`
+		UserID   string `json:"user_id"`
+		Name     string `json:"name"`
+		Username string `json:"username"`
+		Text     string `json:"text"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	req.PostID = strings.TrimSpace(req.PostID)
+	req.UserID = strings.TrimSpace(req.UserID)
+	req.Name = strings.TrimSpace(req.Name)
+	req.Username = strings.TrimSpace(req.Username)
+	req.Text = strings.TrimSpace(req.Text)
+
+	if req.PostID == "" || req.Text == "" {
+		http.Error(w, "post_id and text are required", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		req.Name = "Пользователь MAX"
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	comment := Comment{
+		ID:        time.Now().UnixNano(),
+		PostID:    req.PostID,
+		UserID:    req.UserID,
+		Name:      req.Name,
+		Username:  req.Username,
+		Text:      req.Text,
+		CreatedAt: time.Now().Format("02.01.2006 15:04"),
+	}
+
+	store.Comments = append(store.Comments, comment)
+	_ = saveStore()
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(comment)
+}
+
+func health(w http.ResponseWriter, r *http.Request) {
+	_, _ = w.Write([]byte("ok"))
+}
+
+func main() {
+	loadStore()
+
+	http.HandleFunc("/health", health)
+	http.HandleFunc("/comments", commentsPage)
+	http.HandleFunc("/api/comments", apiList)
+	http.HandleFunc("/api/comments/add", apiAdd)
+
+	log.Println("comments app started on :8081")
+	log.Fatal(http.ListenAndServe(":8081", nil))
+}
+
+const pageHTML = `<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Обсуждение</title>
+<script src="https://st.max.ru/js/max-web-app.js"></script>
+<style>
+body{margin:0;font-family:Arial,sans-serif;background:#111;color:#fff}
+.wrap{max-width:720px;margin:0 auto;padding:16px}
+.card{background:#1c1c1c;border:1px solid #333;border-radius:16px;padding:14px;margin-bottom:12px}
+h1{font-size:22px;margin:0 0 6px}
+.muted{color:#aaa;font-size:13px;margin-bottom:16px}
+input,textarea{width:100%;box-sizing:border-box;border-radius:12px;border:1px solid #444;background:#0b0b0b;color:#fff;padding:12px;margin:6px 0;font-size:15px}
+textarea{min-height:90px;resize:vertical}
+button{width:100%;border:0;border-radius:12px;padding:13px;margin-top:8px;font-size:16px;font-weight:700;background:#e03b20;color:#fff}
+.comment-name{font-weight:700}
+.comment-time{color:#888;font-size:12px;margin-top:4px}
+.comment-text{margin-top:8px;line-height:1.35;white-space:pre-wrap}
+.empty{color:#aaa;text-align:center;padding:20px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>💬 Обсуждение</h1>
+<div class="muted">Комментарии к посту: {{.PostID}}</div>
+
+<div class="card">
+<div class="muted" id="userBox">Определяем пользователя MAX...</div>
+<textarea id="text" placeholder="Напишите комментарий"></textarea>
+<button onclick="sendComment()">Отправить</button>
+</div>
+
+<div id="comments"></div>
+</div>
+
+<script>
+const postID = "{{.PostID}}";
+let maxUser = {
+  user_id: "",
+  name: "Пользователь MAX",
+  username: ""
+};
+
+function readMaxUser(){
+  try {
+    const wa = window.MAX && window.MAX.WebApp ? window.MAX.WebApp : null;
+    if (!wa) return;
+
+    const candidates = [
+      wa.initDataUnsafe && wa.initDataUnsafe.user,
+      wa.initData && wa.initData.user,
+      wa.user,
+      window.maxUser
+    ];
+
+    for (const u of candidates) {
+      if (!u) continue;
+
+      const first = u.first_name || u.firstName || "";
+      const last = u.last_name || u.lastName || "";
+      const full = u.name || [first, last].filter(Boolean).join(" ");
+
+      maxUser = {
+        user_id: String(u.id || u.user_id || u.userId || ""),
+        name: full || u.username || "Пользователь MAX",
+        username: u.username || ""
+      };
+      break;
+    }
+
+    if (wa.ready) wa.ready();
+    if (wa.expand) wa.expand();
+  } catch(e) {}
+}
+
+function renderUserBox(){
+  const box = document.getElementById("userBox");
+  let label = "Вы пишете как: " + escapeHtml(maxUser.name);
+  if (maxUser.username) label += " @" + escapeHtml(maxUser.username);
+  box.innerHTML = label;
+}
+
+readMaxUser();
+
+async function loadComments(){
+  const res = await fetch("/api/comments?post=" + encodeURIComponent(postID));
+  const data = await res.json();
+  const box = document.getElementById("comments");
+
+  if(!data || data.length === 0){
+    box.innerHTML = '<div class="empty">Пока нет комментариев. Будьте первым.</div>';
+    return;
+  }
+
+  let html = "";
+  for (const c of data) {
+    html += '<div class="card">';
+    html += '<div class="comment-name">' + escapeHtml(c.name) + '</div>';
+    html += '<div class="comment-time">' + escapeHtml(c.created_at) + '</div>';
+    html += '<div class="comment-text">' + escapeHtml(c.text) + '</div>';
+    html += '</div>';
+  }
+  box.innerHTML = html;
+}
+
+async function sendComment(){
+  const text = document.getElementById("text").value.trim();
+
+  if(!text){
+    alert("Напишите комментарий");
+    return;
+  }
+
+  await fetch("/api/comments/add", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({
+      post_id: postID,
+      user_id: maxUser.user_id,
+      name: maxUser.name,
+      username: maxUser.username,
+      text: text
+    })
+  });
+
+  document.getElementById("text").value = "";
+  await loadComments();
+}
+
+function escapeHtml(s){
+  return String(s || "").replace(/[&<>"']/g, function(m){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m];
+  });
+}
+
+renderUserBox();
+loadComments();
+setInterval(loadComments, 5000);
+</script>
+</body>
+</html>`

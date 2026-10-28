@@ -33,6 +33,15 @@ RUN apt-get update && \
 RUN apt update
 RUN apt install --reinstall ca-certificates -y
 RUN update-ca-certificates
+RUN apt update
+RUN apt install --reinstall ca-certificates -y
+RUN update-ca-certificates
+
+# Добавляем сертификат Минцифры
+COPY russian_trusted_root_ca.pem /usr/local/share/ca-certificates/russian_trusted_root_ca.crt
+
+# Обновляем хранилище сертификатов
+RUN update-ca-certificates
 
 COPY --from=builder /bot ./bot
 

@@ -2456,12 +2456,21 @@ func paymentStartHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	v, ok := pendingOrders.Load(req.OrderID)
-	if !ok {
-		http.Error(w, "order not found", http.StatusNotFound)
-		return
+	var order PendingOrder
+	
+	if ok {
+	    order = v.(PendingOrder)
+	} else {
+	    var err error
+	    order, err = loadPendingOrder(req.OrderID)
+	    if err != nil {
+	        log.Printf("payment order lookup failed order_id=%s: %v", req.OrderID, err)
+	        http.Error(w, "order not found", http.StatusNotFound)
+	        return
+	    }
+	
+	    pendingOrders.Store(req.OrderID, order)
 	}
-
-	order := v.(PendingOrder)
 
 	if order.UserID == 0 {
 		http.Error(w, "MAX user_id is empty", http.StatusBadRequest)

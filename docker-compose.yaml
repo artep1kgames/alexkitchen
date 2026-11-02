@@ -43,6 +43,9 @@ services:
 
     environment:
       TZ: Europe/Moscow
+    
+    volumes:
+      - ./bot-data:/data
 
     depends_on:
       comments-app:

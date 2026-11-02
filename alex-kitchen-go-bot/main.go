@@ -1096,12 +1096,14 @@ func startDailyBroadcast(ctx context.Context, api *maxbot.Api, publicChatID int6
 
 	hour := 10
 	minute := 0
+	stateFile := "/data/broadcast-last-sent-date"
 
 	if v := os.Getenv("BROADCAST_HOUR"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 && parsed <= 23 {
 			hour = parsed
 		}
 	}
+
 	if v := os.Getenv("BROADCAST_MINUTE"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 && parsed <= 59 {
 			minute = parsed
@@ -1111,26 +1113,70 @@ func startDailyBroadcast(ctx context.Context, api *maxbot.Api, publicChatID int6
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-		lastSentDate := ""
+
+		lastSentDate := loadLastBroadcastDate(stateFile)
+		log.Printf("Последняя публикация: %s", lastSentDate)
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
+
 			case <-ticker.C:
 				now := time.Now()
+
+				if now.Hour() != hour || now.Minute() != minute {
+					continue
+				}
+
 				date := now.Format("2006-01-02")
-				if now.Hour() == hour && now.Minute() == minute && lastSentDate != date {
-					index := now.YearDay() % len(broadcasts)
-					sendPricePostToChannel(ctx, api, publicChatID, broadcasts[index])
+
+				if lastSentDate != "" {
+					lastSent, err := time.ParseInLocation(
+						"2006-01-02",
+						lastSentDate,
+						now.Location(),
+					)
+
+					if err == nil && now.Sub(lastSent) < 48*time.Hour {
+						continue
+					}
+				}
+
+				index := now.YearDay() % len(broadcasts)
+
+				if sendPricePostToChannel(ctx, api, publicChatID, broadcasts[index]) {
+					if err := saveLastBroadcastDate(stateFile, date); err != nil {
+						log.Printf("Ошибка сохранения даты публикации: %v", err)
+						continue
+					}
+
 					lastSentDate = date
-					log.Printf("Ежедневная рассылка отправлена в chat_id=%d", publicChatID)
+					log.Printf("Пост отправлен, следующая публикация не раньше чем через 48 часов")
 				}
 			}
 		}
 	}()
 
-	log.Printf("Ежедневная рассылка включена: %02d:%02d, chat_id=%d", hour, minute, publicChatID)
+	log.Printf("Рассылка включена: %02d:%02d, интервал 48 часов, chat_id=%d", hour, minute, publicChatID)
+}
+
+func loadLastBroadcastDate(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func saveLastBroadcastDate(path, date string) error {
+	tmp := path + ".tmp"
+
+	if err := os.WriteFile(tmp, []byte(date), 0644); err != nil {
+		return err
+	}
+
+	return os.Rename(tmp, path)
 }
 
 func main() {

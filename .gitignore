@@ -31,3 +31,38 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+# Secrets
+.env
+*.env
+
+# Logs
+*.log
+
+# Compiled binaries
+/comments-app/main
+# Environment files and secrets
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# Local backups and temporary files
+*backup*
+*.bak
+*.tmp
+_archive_inspect/
+alex-kitchen-backup.tar.gz
+
+# Local order data
+comments-app/pending-orders.jsonl
+comments-app/comments.json
+
+# Runtime application data
+/comments-app/confirmed-orders.txt
+/comments-app/data/
+
+# Python cache
+__pycache__/
+*.pyc

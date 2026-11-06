@@ -1,28 +1,48 @@
+﻿services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Moscow
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in Coolify}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in Coolify}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Coolify}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./comments-app/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
-services:
   comments-app:
     build:
       context: ./comments-app
       dockerfile: Dockerfile
-    image: alexkitchen/comments-app:latest
-    container_name: alex-comments
     restart: unless-stopped
-
-    ports:
-      - "8081:8081"
-
-    env_file:
-      - ./.env
-
+    expose:
+      - "8081"
     environment:
       TZ: Europe/Moscow
-
+      DATA_DIR: /data
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in Coolify}
+      ADMIN_USERS: ${ADMIN_USERS:?Set ADMIN_USERS in Coolify}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in Coolify}
+      ADMIN_CHAT_IDS: ${ADMIN_CHAT_IDS:-}
+      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
+      BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN in Coolify}
+      MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:-}
+      YOOKASSA_SHOP_ID: ${YOOKASSA_SHOP_ID:-}
+      YOOKASSA_SECRET_KEY: ${YOOKASSA_SECRET_KEY:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?Set PUBLIC_BASE_URL in Coolify}
     volumes:
-      - ./comments-app/comments.json:/app/comments.json
-      - ./comments-app/products.json:/app/products.json
-      - ./comments-app/pending-orders.jsonl:/app/pending-orders.jsonl
-      - ./comments-app/confirmed-orders.txt:/app/confirmed-orders.txt
-
+      - comments_data:/data
+      - product_uploads:/app/static/products/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8081/health"]
       interval: 30s
@@ -34,19 +54,29 @@ services:
     build:
       context: ./alex-kitchen-go-bot
       dockerfile: Dockerfile
-    image: alexkitchen/max-bot:latest
-    container_name: alex-max-bot
     restart: unless-stopped
-
-    env_file:
-      - ./.env
-
     environment:
       TZ: Europe/Moscow
-    
+      BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN in Coolify}
+      PRICE_BOT_URL: ${PRICE_BOT_URL:-}
+      BOT_LINK: ${BOT_LINK:-}
+      BOT_URL: ${BOT_URL:-}
+      COMMENTS_APP_URL: ${COMMENTS_APP_URL:?Set COMMENTS_APP_URL in Coolify}
+      COMMENTS_BASE_URL: ${COMMENTS_BASE_URL:-}
+      COMMENTS_ENABLED: ${COMMENTS_ENABLED:-true}
+      ADMIN_CHAT_IDS: ${ADMIN_CHAT_IDS:-}
+      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
+      PUBLIC_CHAT_ID: ${PUBLIC_CHAT_ID:-}
+      BROADCAST_HOUR: ${BROADCAST_HOUR:-10}
+      BROADCAST_MINUTE: ${BROADCAST_MINUTE:-0}
     volumes:
-      - ./bot-data:/data
-
+      - bot_data:/data
     depends_on:
       comments-app:
         condition: service_healthy
+
+volumes:
+  postgres_data:
+  comments_data:
+  bot_data:
+  product_uploads:

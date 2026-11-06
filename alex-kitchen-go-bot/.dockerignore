@@ -1,0 +1,8 @@
+﻿.env
+.env.*
+!.env.example
+*.bak
+*.log
+._*
+main
+.git/

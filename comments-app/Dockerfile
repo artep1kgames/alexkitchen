@@ -1,26 +1,27 @@
-
 # Build stage
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-bookworm AS builder
 
-WORKDIR /build
+WORKDIR /src
 
-COPY main.go .
+COPY go.mod go.sum ./
+RUN go mod download
 
-RUN CGO_ENABLED=0 GO111MODULE=off \
-    go build -trimpath -ldflags="-s -w" -o comments-app main.go
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/comments-app .
 
 # Runtime stage
-FROM alpine:3.22
+FROM debian:bookworm-slim
 
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata wget && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/comments-app ./comments-app
-
+COPY --from=builder /out/comments-app ./comments-app
 COPY static/ ./static/
-COPY comments.json products.json ./
-COPY pending-orders.jsonl confirmed-orders.txt ./
 
 ENV TZ=Europe/Moscow
 

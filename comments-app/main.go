@@ -2,6 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -10,12 +14,28 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 )
+
+func generateIdempotenceKey() (string, error) {
+	b := make([]byte, 16)
+
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(b), nil
+}
+
+var dbPool *pgxpool.Pool
 
 type Comment struct {
 	ID        int64  `json:"id"`
@@ -32,6 +52,12 @@ type Store struct {
 	Comments []Comment `json:"comments"`
 }
 
+var dataDir = "."
+
+func dataFile(name string) string {
+	return filepath.Join(dataDir, name)
+}
+
 var storePath = "comments.json"
 var store = Store{}
 var pageTpl = template.Must(template.New("page").Parse(pageHTML))
@@ -46,7 +72,7 @@ func loadStore() {
 }
 
 func saveStore() error {
-	data, err := json.MarshalIndent(store, "", "  ")
+	data, err := json.MarshalIndent(&store, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -122,7 +148,12 @@ func apiAdd(w http.ResponseWriter, r *http.Request) {
 	}
 
 	store.Comments = append(store.Comments, comment)
-	_ = saveStore()
+	if err := saveStore(); err != nil {
+		store.Comments = store.Comments[:len(store.Comments)-1]
+		log.Printf("Не удалось сохранить комментарий: %v", err)
+		http.Error(w, "failed to save comment", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(comment)
@@ -142,19 +173,80 @@ func health(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
+func initDB() {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL не задан")
+	}
+
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		log.Fatalf("Ошибка конфигурации PostgreSQL: %v", err)
+	}
+
+	dbPool, err = pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		log.Fatalf("Ошибка подключения к PostgreSQL: %v", err)
+	}
+
+	if err := dbPool.Ping(context.Background()); err != nil {
+		log.Fatalf("PostgreSQL недоступен: %v", err)
+	}
+
+	log.Println("PostgreSQL подключён успешно")
+}
+
 func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Println("Файл .env не найден, используются системные переменные окружения")
+	}
+
+	if configured := strings.TrimSpace(os.Getenv("DATA_DIR")); configured != "" {
+
+		dataDir = configured
+
+	}
+
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+
+		log.Fatalf("Не удалось создать каталог данных: %v", err)
+
+	}
+
+	storePath = dataFile("comments.json")
+
 	loadStore()
+	if err := loadAdminConfig(); err != nil {
+		log.Fatal("Ошибка конфигурации администраторов: ", err)
+	}
+
+	initDB()
+	defer dbPool.Close()
 
 	http.HandleFunc("/health", health)
 	http.HandleFunc("/app", appPage)
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
 	http.HandleFunc("/shop", shopPage)
 	http.HandleFunc("/api/products", productsHandler)
+	http.HandleFunc("/api/cart/reserve", cartReserveHandler)
+	http.HandleFunc("/api/cart/clear", cartClearHandler)
 	http.HandleFunc("/api/order", orderHandler)
-	http.HandleFunc("/api/order/payment-start", paymentStartHandler)
+	http.HandleFunc("/api/order/pay", yooKassaPaymentHandler)
+	http.HandleFunc("/api/yookassa/webhook", yooKassaWebhookHandler)
+	http.HandleFunc("/api/order/payment-status", orderPaymentStatusHandler)
 	http.HandleFunc("/comments", commentsPage)
 	http.HandleFunc("/api/comments", apiList)
 	http.HandleFunc("/api/comments/add", apiAdd)
+	http.HandleFunc("/admin", adminPage)
+	http.HandleFunc("/api/admin/max-visibility", adminMaxVisibilityHandler)
+	http.HandleFunc("/admin/login", adminLoginHandler)
+	http.HandleFunc("/admin/logout", adminLogoutHandler)
+	http.Handle("/api/admin/products", requireAdmin(adminProductsHandler))
+	http.Handle("/api/admin/products/update", requireAdmin(adminUpdateProductHandler))
+	http.Handle("/api/admin/products/delete", requireAdmin(adminDeleteProductHandler))
+	http.Handle("/api/admin/products/create", requireAdmin(adminCreateProductHandler))
+	http.Handle("/api/admin/products/upload-image", requireAdmin(adminUploadProductImageHandler))
+	http.Handle("/api/admin/products/bulk-update", requireAdmin(adminBulkUpdateProductsHandler))
 
 	log.Println("comments app started on :8081")
 	log.Fatal(http.ListenAndServe(":8081", nil))
@@ -740,7 +832,7 @@ body{
   <div class="header">
     <button class="close" onclick="closeApp()">×</button>
     <div class="header-title">Alex Kitchen | Обсуждение</div>
-    <button class="menu">···</button>
+    <button class="menu">Р’В·Р’В·Р’В·</button>
   </div>
 
   <div class="toolbar">
@@ -752,7 +844,7 @@ body{
   <div class="chat" id="comments"></div>
 
   <div class="composer">
-    <button class="attach">⌘</button>
+    <button class="attach">РІРЉВ</button>
     <textarea id="text" class="input" placeholder="Сообщение" rows="1"></textarea>
     <button class="send" onclick="sendComment()">↑</button>
   </div>
@@ -1297,7 +1389,15 @@ body{margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,BlinkMacSys
           <p>Настоящие гастрономические приключения начинаются тут.</p>
         </div>
       </div>
-      </div>
+
+      <button
+        id="adminEntryButton"
+        type="button"
+        style="display:none;margin-top:14px;padding:10px 18px;border:0;border-radius:10px;background:#d9a441;color:#1b1b1b;font-weight:700;cursor:pointer;"
+        onclick="location.href='/admin'">
+        Панель администратора
+      </button>
+    </div>
 
     <div class="banner">
       <div class="banner-title">Свежайшее мясо и фермерские деликатесы</div>
@@ -1355,6 +1455,8 @@ async function loadProductsCatalog(){
 
     const products = await response.json();
 
+    lastCatalogSignature = getCatalogSignature(products);
+
     const sectionMap = {
       "МЯСО": {id:"meat", icon:"🥩", desc:"Свежее мясо"},
       "МЯСНЫЕ ДЕЛИКАТЕСЫ": {id:"delicacies", icon:"🥓", desc:"ВК, сыровяленые и деликатесы к пенному"},
@@ -1365,7 +1467,6 @@ async function loadProductsCatalog(){
     const dynamic = {};
 
     for(const product of products){
-      if(product.active === false) continue;
 
       const sectionName = product.section || "ДРУГОЕ";
       if(!dynamic[sectionName]){
@@ -1402,7 +1503,11 @@ async function loadProductsCatalog(){
         product.name,
         priceText,
         product.description || "",
-        product.image || ""
+        product.image || "",
+        product.id,
+        product.stock,
+        product.stock_unit || product.price_unit || "шт",
+        product.active
       ]);
     }
 
@@ -1415,10 +1520,171 @@ async function loadProductsCatalog(){
     renderCategories();
   }
 }
-
+function getCatalogSignature(products){
+  return JSON.stringify(products.map(product => ({
+    id: product.id,
+    section: product.section,
+    category: product.category,
+    name: product.name,
+    price: product.price,
+    price_unit: product.price_unit,
+    description: product.description,
+    image: product.image,
+    active: product.active,
+    sort: product.sort
+  })));
+}
 
 loadProductsCatalog();
 let cart = [];
+
+try {
+  const savedCart = localStorage.getItem("alex_cart");
+  if(savedCart){
+    const parsedCart = JSON.parse(savedCart);
+    if(Array.isArray(parsedCart)){
+      cart = parsedCart;
+    }
+  }
+} catch(e) {
+  console.error("Не удалось восстановить корзину:", e);
+}
+
+let cartToken = localStorage.getItem("alex_cart_token");
+
+if(!cartToken){
+  cartToken = crypto.randomUUID();
+  localStorage.setItem("alex_cart_token", cartToken);
+}
+
+let cartExpiresAt = Number(
+  localStorage.getItem("alex_cart_expires_at") || 0
+);
+
+if(!Number.isFinite(cartExpiresAt)){
+  cartExpiresAt = 0;
+}
+
+// Однократно очищаем старую корзину без сохранённого срока резерва
+if(cart.length > 0 && cartExpiresAt <= 0){
+  cartExpiresAt = Date.now();
+  localStorage.setItem("alex_cart_expires_at", String(cartExpiresAt));
+}
+
+let latestProductStocks = {};
+let lastCatalogSignature = "";
+let stockRefreshBusy = false;
+
+async function refreshProductStocks(){
+  if(stockRefreshBusy) return;
+
+  stockRefreshBusy = true;
+
+  try {
+    const response = await fetch("/api/products");
+    if(!response.ok) throw new Error("HTTP " + response.status);
+
+    const products = await response.json();
+
+    const catalogSignature = getCatalogSignature(products);
+
+    if(lastCatalogSignature && catalogSignature !== lastCatalogSignature){
+      const savedQuantities = getSelectedProductQuantities();
+      const categoryId = currentCategoryId;
+
+      await loadProductsCatalog();
+
+      if(categoryId){
+        openCategory(categoryId, savedQuantities);
+      }
+    }
+
+    lastCatalogSignature = catalogSignature;
+
+    const stocks = {};
+
+    for(const product of products){
+      const availableStock = product.available_stock;
+
+      stocks[product.id] = {
+        stock: availableStock === null || availableStock === undefined || availableStock === ""
+          ? null
+          : Number(availableStock),
+        stock_unit: product.stock_unit || product.price_unit || "шт",
+        active: product.active !== false,
+        image: product.image || ""
+      };
+    }
+
+    latestProductStocks = stocks;
+
+    for(const section of categories){
+      for(const sub of section.subcategories || []){
+        for(const item of sub.items || []){
+          const current = stocks[item[4]];
+          if(!current) continue;
+
+          item[5] = current.stock;
+          item[6] = current.stock_unit;
+          item[7] = current.active;
+        }
+      }
+    }
+
+    for(const item of cart){
+      const current = stocks[item.product_id];
+      if(!current) continue;
+
+      item.stock = current.stock;
+      item.stock_unit = current.stock_unit;
+    }
+
+    document.querySelectorAll(".card[data-product-id]").forEach(card => {
+      const current = stocks[card.dataset.productId];
+      if(!current) return;
+
+      if(current.image){
+        let image = card.querySelector(".product-img");
+
+        if(!image){
+          image = document.createElement("img");
+          image.className = "product-img";
+          image.alt = card.querySelector(".name")?.textContent || "";
+          card.insertBefore(image, card.firstChild);
+        }
+
+        if(image.getAttribute("src") !== current.image){
+          image.src = current.image + "?v=" + Date.now();
+        }
+      }
+
+      const button = card.querySelector(".to-cart-btn");
+
+      if(!current.active || (current.stock !== null && current.stock <= 0)){
+        button.textContent = "Нет в наличии";
+        button.disabled = true;
+      } else if(current.stock !== null && Number(card.dataset.selectedQty || 0) > current.stock){
+        button.textContent = "В наличии: " + current.stock + " " + current.stock_unit;
+        button.disabled = true;
+      } else {
+        button.textContent = "В корзину";
+        button.disabled = false;
+      }
+    });
+
+  } catch(error) {
+    console.error("Ошибка обновления остатков:", error);
+  } finally {
+    stockRefreshBusy = false;
+  }
+}
+
+refreshProductStocks();
+setInterval(refreshProductStocks, 5000);
+
+// Проверяем истечение резерва корзины каждую секунду
+clearExpiredCart();
+setInterval(clearExpiredCart, 1000);
 
 function renderCategories(){
   const box = document.getElementById("categories");
@@ -1435,7 +1701,16 @@ function renderCategories(){
   }
 }
 
-function openCategory(id){
+let currentCategoryId = null;
+function getSelectedProductQuantities(){
+  const quantities = {};
+  document.querySelectorAll(".card[data-product-id]").forEach(card => {
+    quantities[card.dataset.productId] = Number(card.dataset.selectedQty || 0);
+  });
+  return quantities;
+}
+function openCategory(id, savedQuantities = null){
+  currentCategoryId = id;
   setTimeout(function(){
     window.scrollTo(0, 0);
     document.documentElement.scrollTop = 0;
@@ -1484,7 +1759,7 @@ function openCategory(id){
   if(c.content){
     box.className = "products";
     const card = document.createElement("div");
-    card.className = "card info-card";
+    card.className = "card";
     card.innerHTML = c.content;
     box.appendChild(card);
     return;
@@ -1492,66 +1767,202 @@ function openCategory(id){
 
   box.className = "products";
 
-  for(const item of c.items){
-    const card = document.createElement("div");
-    card.className = "card";
-    card.innerHTML =
-      (item[3] ? '<img class="product-img" src="' + escapeHtml(item[3]) + '" alt="' + escapeHtml(item[0]) + '">' : '') +
-      '<div class="name">' + escapeHtml(item[0]) + '</div>' +
-      '<div class="note">' + escapeHtml(item[2]) + '</div>' +
-      '<div class="row"><div class="price">' + escapeHtml(item[1]) + '</div></div>' +
-      '<div class="qty-wrap">' +
-        '<button class="qty-btn minus">−</button>' +
-        '<div class="qty-num">' + formatQty(item[1], getStep(item[1])) + '</div>' +
-        '<button class="qty-btn plus">+</button>' +
-      '</div>' +
-      '<button class="to-cart-btn">В корзину</button>';
+for(const item of c.items){
+  const card = document.createElement("div");
+  card.className = "card";
+  card.dataset.productId = item[4] || "";
 
+  const productId = item[4];
+  const stock = item[5] === null || item[5] === undefined || item[5] === ""
+    ? null
+    : Number(item[5]);
+  const stockUnit = item[6] || "шт";
+  const active = item[7] !== false;
+  const unavailable = !active || (stock !== null && stock <= 0);
+
+  card.innerHTML =
+    (item[3] ? '<img class="product-img" src="' + escapeHtml(item[3]) + '" alt="' + escapeHtml(item[0]) + '">' : '') +
+    '<div class="name">' + escapeHtml(item[0]) + '</div>' +
+    '<div class="note">' + escapeHtml(item[2]) + '</div>' +
+    '<div class="row"><div class="price">' + escapeHtml(item[1]) + '</div></div>' +
+    '<div class="qty-wrap">' +
+      '<button class="qty-btn minus">−</button>' +
+      '<div class="qty-num">' + formatQty(item[1], getStep(item[1])) + '</div>' +
+      '<button class="qty-btn plus">+</button>' +
+    '</div>' +
+    '<button class="to-cart-btn">' +
+      (unavailable ? "Нет в наличии" : "В корзину") +
+    '</button>';
+
+  if(productId){
     let qty = getStep(item[1]);
-    const qtyNode = card.querySelector(".qty-num");
+    if(savedQuantities && Number(savedQuantities[productId]) > 0){
+      qty = Number(savedQuantities[productId]);
+    } else if(stock !== null) {
+      qty = Math.min(qty, stock);
+    }
 
-    card.querySelector(".to-cart-btn").onclick = function(){
-      addToCart(item[0], item[1], qty, item[3] || "");
+    if(stock !== null) qty = Math.min(qty, stock);
+    card.dataset.selectedQty = String(qty);
+
+    const qtyNode = card.querySelector(".qty-num");
+    qtyNode.textContent = formatQty(item[1], qty);
+    const addButton = card.querySelector(".to-cart-btn");
+    const plusButton = card.querySelector(".plus");
+
+
+    addButton.onclick = function(){
+      const current = latestProductStocks[productId] || {
+        stock: stock,
+        stock_unit: stockUnit,
+        active: active
+      };
+
+      addToCart(
+        item[0],
+        item[1],
+        qty,
+        item[3] || "",
+        productId,
+        current.stock,
+        current.stock_unit,
+        current.active
+      );
     };
+
+    function updateAddButton(){
+      const current = latestProductStocks[productId] || {
+        stock: stock,
+        stock_unit: stockUnit,
+        active: active
+      };
+
+      const currentStock = current.stock;
+      const currentUnit = current.stock_unit;
+
+      const unavailable = !current.active ||
+        (currentStock !== null && currentStock <= 0);
+
+      const exceeds = currentStock !== null && qty > currentStock;
+
+      if(unavailable){
+        addButton.textContent = "Нет в наличии";
+        addButton.disabled = true;
+      } else if(exceeds){
+        addButton.textContent = "В наличии: " + currentStock + " " + currentUnit;
+        addButton.disabled = true;
+      } else {
+        addButton.textContent = "В корзину";
+        addButton.disabled = false;
+      }
+    }
 
     card.querySelector(".minus").onclick = function(){
       const step = getStep(item[1]);
-      qty = Math.max(step, qty - step);
+      qty = Math.max(step, Math.round((qty - step) * 1000) / 1000);
       qtyNode.textContent = formatQty(item[1], qty);
+      card.dataset.selectedQty = String(qty);
+      updateAddButton();
     };
 
-    card.querySelector(".plus").onclick = function(){
+    plusButton.onclick = function(){
       const step = getStep(item[1]);
-      qty += step;
+      qty = Math.round((qty + step) * 1000) / 1000;
       qtyNode.textContent = formatQty(item[1], qty);
+      card.dataset.selectedQty = String(qty);
+      updateAddButton();
     };
-    box.appendChild(card);
+
+  updateAddButton();
   }
+
+  box.appendChild(card);
+}
 }
 
 function showHome(){
+  currentCategoryId = null;
   document.getElementById("categoryView").classList.add("hidden");
   document.getElementById("home").classList.remove("hidden");
 }
 
-function addToCart(name, price, qty, image){
-  if(price === "—") return;
+async function addToCart(name, price, qty, image, productId, stock, stockUnit, active){
+  if(price === "—" || !active || (stock !== null && stock <= 0)) return;
 
-  const existing = cart.find(x => x.name === name && x.price === price);
-  if(existing){
-    existing.qty = Math.round((existing.qty + qty) * 10) / 10;
-  }else{
-    cart.push({name:name, price:price, qty:qty, image:image || ""});
+  const existing = cart.find(x => x.product_id === productId);
+  const currentQty = existing ? existing.qty : 0;
+  const newQty = Math.round((currentQty + qty) * 1000) / 1000;
+
+  try {
+    const response = await fetch("/api/cart/reserve", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        cart_token: cartToken,
+        product_id: productId,
+        quantity: newQty
+      })
+    });
+
+    const result = await response.json();
+
+    if(!response.ok || !result.ok){
+      if(result.available_stock !== undefined){
+        alert("Доступно только " + result.available_stock + " " + stockUnit);
+      } else {
+        alert("Не удалось зарезервировать товар. " + (result.error || ""));
+      }
+
+      await refreshProductStocks();
+      return;
+    }
+
+    if(existing){
+      existing.qty = newQty;
+      existing.stock = stock;
+      existing.stock_unit = stockUnit;
+    }else{
+      cart.push({
+        product_id: productId,
+        name: name,
+        price: price,
+        qty: qty,
+        image: image || "",
+        stock: stock,
+        stock_unit: stockUnit
+      });
+    }
+
+    startCartExpiration();
+    updateCart();
+
+    const btn = document.getElementById("cartBtn");
+    btn.textContent = "✅ Добавлено в корзину";
+    setTimeout(updateCart, 700);
+
+    await refreshProductStocks();
+
+  } catch(error) {
+    console.error("Ошибка резервирования:", error);
+    alert("Не удалось связаться с сервером. Товар не добавлен в корзину.");
+  }
+}
+
+function startCartExpiration(){
+  if(cart.length === 0){
+    cartExpiresAt = 0;
+    localStorage.removeItem("alex_cart_expires_at");
+    return;
   }
 
-  updateCart();
-
-  const btn = document.getElementById("cartBtn");
-  btn.textContent = "✅ Добавлено в корзину";
-  setTimeout(updateCart, 700);
+  cartExpiresAt = Date.now() + 15 * 60 * 1000;
+  localStorage.setItem("alex_cart_expires_at", String(cartExpiresAt));
 }
 
 function updateCart(){
+  localStorage.setItem("alex_cart", JSON.stringify(cart));
   const btn = document.getElementById("cartBtn");
   const count = cart.length;
   btn.textContent = count ? "🛒 Корзина: " + count + " поз." : "🛒 Корзина пока пуста";
@@ -1579,7 +1990,7 @@ function openCart(){
       const x = cart[i];
       const img = x.image
         ? '<img class="cart-img" src="' + escapeHtml(x.image) + '" alt="' + escapeHtml(x.name) + '">'
-        : '<div class="cart-img-placeholder">🥩</div>';
+        : '<div class="cart-img-placeholder">СЂСџТђВ©</div>';
 
       html += '<div class="cart-item">';
       html += img;
@@ -1607,8 +2018,19 @@ function openCart(){
 
   html += '</div>';
 
+
   modal.innerHTML = html;
   document.body.appendChild(modal);
+
+  let lastY = 0;
+  let startY = 0;
+  let startScrollTop = 0;
+
+  modal.addEventListener("touchstart", function(e){
+    startY = e.touches[0].clientY;
+    lastY = startY;
+    startScrollTop = modal.scrollTop;
+  }, {passive:true});
 
   modal.addEventListener("touchmove", function(e){
     lastY = e.touches[0].clientY;
@@ -1623,36 +2045,229 @@ function openCart(){
   });
 }
 
-function cartPlus(i){
-  const x = cart[i];
-  if(!x) return;
-  const step = getStep(x.price);
-  x.qty = Math.round((x.qty + step) * 10) / 10;
-  updateCart();
-  openCart();
-}
 
-function cartMinus(i){
+async function cartPlus(i){
   const x = cart[i];
   if(!x) return;
-  const step = getStep(x.price);
-  x.qty = Math.round((x.qty - step) * 10) / 10;
-  if(x.qty <= 0){
-    cart.splice(i, 1);
+
+  const current = latestProductStocks[x.product_id];
+  const stock = current ? current.stock : x.stock;
+  const unit = current ? current.stock_unit : x.stock_unit;
+  const active = current ? current.active : true;
+
+  if(!active){
+    alert("Товар больше недоступен");
+    return;
   }
-  updateCart();
-  openCart();
+
+  const step = getStep(x.price);
+  const newQty = Math.round((x.qty + step) * 1000) / 1000;
+
+  try {
+    const response = await fetch("/api/cart/reserve", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        cart_token: cartToken,
+        product_id: x.product_id,
+        quantity: newQty
+      })
+    });
+
+    const result = await response.json();
+
+    if(!response.ok || !result.ok){
+      alert(result.available_stock !== undefined
+        ? "Доступно только " + result.available_stock + " " + unit
+        : "Не удалось изменить резерв товара");
+      await refreshProductStocks();
+      return;
+    }
+
+    x.qty = newQty;
+    x.stock = stock;
+    x.stock_unit = unit;
+
+    startCartExpiration();
+    updateCart();
+    openCart();
+    await refreshProductStocks();
+
+  } catch(error) {
+    console.error("Ошибка изменения резерва:", error);
+    alert("Не удалось связаться с сервером");
+  }
 }
 
-function cartRemove(i){
-  cart.splice(i, 1);
-  updateCart();
-  openCart();
+
+
+async function cartMinus(i){
+  const x = cart[i];
+  if(!x) return;
+
+  const step = getStep(x.price);
+  const newQty = Math.round((x.qty - step) * 1000) / 1000;
+
+  try {
+    const response = await fetch("/api/cart/reserve", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        cart_token: cartToken,
+        product_id: x.product_id,
+        quantity: Math.max(0, newQty)
+      })
+    });
+
+    const result = await response.json();
+
+    if(!response.ok || !result.ok){
+      alert("Не удалось изменить резерв товара");
+      return;
+    }
+
+    if(newQty <= 0){
+      cart.splice(i, 1);
+    } else {
+      x.qty = newQty;
+    }
+
+    startCartExpiration();
+    updateCart();
+    openCart();
+    await refreshProductStocks();
+
+  } catch(error) {
+    console.error("Ошибка изменения резерва:", error);
+    alert("Не удалось связаться с сервером");
+  }
 }
+
+
+
+async function cartRemove(i){
+  const x = cart[i];
+  if(!x) return;
+
+  try {
+    const response = await fetch("/api/cart/reserve", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        cart_token: cartToken,
+        product_id: x.product_id,
+        quantity: 0
+      })
+    });
+
+    const result = await response.json();
+
+    if(!response.ok || !result.ok){
+      alert("Не удалось освободить резерв товара");
+      return;
+    }
+
+    cart.splice(i, 1);
+
+    startCartExpiration();
+    updateCart();
+    openCart();
+    await refreshProductStocks();
+
+  } catch(error) {
+    console.error("Ошибка удаления товара:", error);
+    alert("Не удалось связаться с сервером");
+  }
+}
+
 
 function closeCart(){
   const modal = document.getElementById("cartModal");
   if(modal) modal.remove();
+}
+
+async function clearExpiredCart(){
+  if(!cart.length || !cartExpiresAt || Date.now() < cartExpiresAt) return;
+
+  const pendingOrderID = localStorage.getItem("alex_pending_order_id");
+
+  if(pendingOrderID){
+    try {
+      const res = await fetch(
+        "/api/order/payment-status?order_id=" + encodeURIComponent(pendingOrderID),
+        {cache: "no-store"}
+      );
+
+      if(!res.ok) return;
+
+      const payment = await res.json();
+
+      // Реальный платёж существует — корзину не трогаем
+      if(payment.has_payment_id) return;
+
+      // Успешная оплата — ждём штатной обработки
+      if(payment.status === "succeeded") return;
+
+      // Отменённую оплату можно очистить после истечения резерва
+      if(payment.status === "canceled"){
+        localStorage.removeItem("alex_pending_order_id");
+      } else if(payment.status === "creating"){
+        const updatedAt = Date.parse(payment.updated_at);
+
+        // Не трогаем свежую попытку создания платежа
+        if(!Number.isFinite(updatedAt) || Date.now() - updatedAt < 5 * 60 * 1000){
+          return;
+        }
+
+        // Зависшая попытка без payment_id
+        localStorage.removeItem("alex_pending_order_id");
+      } else {
+        // Неизвестный статус — безопаснее сохранить корзину
+        return;
+      }
+    } catch(error) {
+      console.error("Не удалось проверить оплату:", error);
+      return;
+    }
+  }
+
+  const oldToken = cartToken;
+
+  cart = [];
+  cartExpiresAt = 0;
+
+  localStorage.removeItem("alex_cart");
+  localStorage.removeItem("alex_cart_expires_at");
+
+  cartToken = crypto.randomUUID();
+  localStorage.setItem("alex_cart_token", cartToken);
+
+  updateCart();
+  closeCart();
+
+  try {
+    const res = await fetch("/api/cart/clear", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({cart_token: oldToken})
+    });
+
+    if(!res.ok){
+      console.error("Не удалось освободить резервы:", res.status);
+    }
+  } catch(error) {
+    console.error("Ошибка освобождения резервов:", error);
+  }
+
+  await refreshProductStocks();
+
+  alert("Время резервирования истекло. Корзина очищена.");
 }
 
 function getUnitForPrice(price){
@@ -1720,6 +2335,13 @@ function setReceiveType(type){
 }
 
 async function finishOrder(){
+  const pendingOrderID = localStorage.getItem("alex_pending_order_id");
+
+  if(pendingOrderID){
+    payWithYooKassa(pendingOrderID);
+    return;
+  }
+
   const name = document.getElementById("clientName").value.trim();
   const phone = document.getElementById("clientPhone").value.trim();
   const comment = document.getElementById("clientComment").value.trim();
@@ -1729,6 +2351,7 @@ async function finishOrder(){
 
   const items = cart.map(function(x){
     return {
+      product_id: x.product_id,
       name: x.name,
       price: x.price,
       qty: x.qty,
@@ -1747,6 +2370,7 @@ async function finishOrder(){
 
   const payload = {
     name: name,
+    cart_token: cartToken,
     phone: phone,
     receive: receiveType,
     comment: comment,
@@ -1769,7 +2393,9 @@ async function finishOrder(){
     }
 
     const data = await res.json();
-    cart = [];
+
+    localStorage.setItem("alex_pending_order_id", data.order_id);
+
     updateCart();
     closeCart();
 
@@ -1784,7 +2410,7 @@ async function finishOrder(){
       + '</div>'
       + '<div style="background:#f5f5f5;border-radius:18px;padding:14px;margin:14px 0;font-size:15px;line-height:1.45;">'
       + 'Для бронирования заказа необходимо внести предоплату <b>300 ₽</b>.<br><br>'
-      + '<button type="button" onclick="startPaymentTimer(\'' + data.order_id + '\')" style="width:100%;height:54px;border:0;border-radius:18px;background:#ffdd2d;color:#111;font-size:17px;font-weight:900;">💳 Оплатить 300 ₽</button>'
+      + '<button type="button" onclick="payWithYooKassa(\'' + data.order_id + '\')" style="width:100%;height:54px;border:0;border-radius:18px;background:#ffdd2d;color:#111;font-size:17px;font-weight:900;">Оплатить 300 ₽</button>'
       + '</div>'
       + '<button class="cart-submit" onclick="location.reload()">Вернуться в магазин</button>'
       + '</div>';
@@ -1797,45 +2423,90 @@ async function finishOrder(){
 
 
 
-async function confirmOrderAndPay(orderID){
+async function payWithYooKassa(orderID){
   try{
-    fetch("/api/order/confirm", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        order_id: orderID
-      })
-    }).catch(function(e){
-      console.error("order confirm failed:", e);
-    });
-
-    window.location.href = "https://max.ru/tbank_pay_bot?startapp=7dTR5Q9i7TXLNokwgxmKEMnZ";
-  }catch(e){
-    alert("Не удалось оформить заказ: " + e.message);
-  }
-}
-
-async function startPaymentTimer(orderID){
-  try{
-    const res = await fetch("/api/order/payment-start", {
+    const res = await fetch("/api/order/pay", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
       body: JSON.stringify({order_id: orderID})
     });
 
-    if(!res.ok){
-      const t = await res.text();
-      alert("Не удалось запустить уведомление по заказу: " + t);
-      return;
+    const responseText = await res.text();
+    let data = {};
+
+    try {
+      data = JSON.parse(responseText);
+    } catch(e) {}
+
+    if(!res.ok || !data.confirmation_url){
+      throw new Error(data.error || responseText || "Не удалось создать платёж");
     }
 
-    window.location.href = "https://max.ru/tbank_pay_bot?startapp=7dTR5Q9i7TXLNokwgxmKEMnZ";
+    window.location.href = data.confirmation_url;
   }catch(e){
-    alert("Ошибка: " + e.message);
+    alert("Не удалось перейти к оплате: " + e.message);
   }
 }
+
+async function checkReturnedPayment(){
+  const params = new URLSearchParams(window.location.search);
+
+  if(params.get("payment") !== "return"){
+    return;
+  }
+
+  const orderID = localStorage.getItem("alex_pending_order_id");
+
+  if(!orderID){
+    return;
+  }
+
+  const deadline = Date.now() + 60000;
+
+  while(Date.now() < deadline){
+    try{
+      const res = await fetch(
+        "/api/order/payment-status?order_id=" + encodeURIComponent(orderID),
+        {cache: "no-store"}
+      );
+
+      if(res.ok){
+        const data = await res.json();
+
+        if(data.status === "succeeded"){
+          cart = [];
+          localStorage.removeItem("alex_pending_order_id");
+
+          cartToken = crypto.randomUUID();
+          localStorage.setItem("alex_cart_token", cartToken);
+
+          updateCart();
+
+          alert("Предоплата 300 ₽ получена. Корзина очищена.");
+
+          const url = new URL(window.location.href);
+          url.searchParams.delete("payment");
+          history.replaceState({}, "", url.pathname + url.search + url.hash);
+
+          return;
+        }
+
+        if(data.status === "canceled"){
+          alert("Платёж отменён. Корзина и резерв товаров сохранены. Можно повторить оплату.");
+          return;
+        }
+      }
+    }catch(e){
+      console.error("Ошибка проверки оплаты:", e);
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 2500));
+  }
+
+  alert("Подтверждение оплаты пока не получено. Корзина и резерв сохранены. Попробуйте проверить позже.");
+}
+
+window.addEventListener("load", checkReturnedPayment);
 
 function sendCartOrder(){
   if(!cart.length){
@@ -1932,6 +2603,33 @@ function formatQty(price, qty){
 
   return qty.toFixed(1).replace(".0","") + " кг";
 }
+
+async function checkAdminEntry() {
+  try {
+    const wa = window.WebApp || null;
+    const user = wa && wa.initDataUnsafe && wa.initDataUnsafe.user;
+    const userID = user && user.id ? String(user.id) : "";
+
+    if (!userID) return;
+
+    const response = await fetch(
+      "/api/admin/max-visibility?user_id=" + encodeURIComponent(userID)
+    );
+
+    if (!response.ok) return;
+
+    const result = await response.json();
+
+    if (result.show) {
+      const button = document.getElementById("adminEntryButton");
+      if (button) button.style.display = "inline-block";
+    }
+  } catch (error) {
+    console.error("Admin visibility check failed:", error);
+  }
+}
+
+checkAdminEntry();
 
 renderCategories();
 updateCart();
@@ -2127,21 +2825,74 @@ go();
 </html>`
 
 type ShopOrderItem struct {
-	Name  string  `json:"name"`
-	Price string  `json:"price"`
-	Qty   float64 `json:"qty"`
-	Unit  string  `json:"unit"`
-	Line  int     `json:"line"`
+	ProductID string  `json:"product_id"`
+	Name      string  `json:"name"`
+	Price     string  `json:"price"`
+	Qty       float64 `json:"qty"`
+	Unit      string  `json:"unit"`
+	Line      int     `json:"line"`
+}
+
+type YooKassaCreateRequest struct {
+	Amount struct {
+		Value    string `json:"value"`
+		Currency string `json:"currency"`
+	} `json:"amount"`
+
+	Capture      bool `json:"capture"`
+	Confirmation struct {
+		Type      string `json:"type"`
+		ReturnURL string `json:"return_url"`
+	} `json:"confirmation"`
+
+	Description string            `json:"description"`
+	Metadata    map[string]string `json:"metadata"`
+}
+
+type YooKassaCreateResponse struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+
+	Confirmation struct {
+		ConfirmationURL string `json:"confirmation_url"`
+	} `json:"confirmation"`
+}
+
+type YooKassaErrorResponse struct {
+	Type        string `json:"type"`
+	Description string `json:"description"`
+	Parameter   string `json:"parameter"`
+	Code        string `json:"code"`
+}
+
+type YooKassaWebhookRequest struct {
+	Event  string `json:"event"`
+	Object struct {
+		ID string `json:"id"`
+	} `json:"object"`
+}
+
+type YooKassaPaymentDetails struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+
+	Amount struct {
+		Value    string `json:"value"`
+		Currency string `json:"currency"`
+	} `json:"amount"`
+
+	Metadata map[string]string `json:"metadata"`
 }
 
 type ShopOrderRequest struct {
-	Name    string          `json:"name"`
-	Phone   string          `json:"phone"`
-	Receive string          `json:"receive"`
-	Comment string          `json:"comment"`
-	Total   int             `json:"total"`
-	Items   []ShopOrderItem `json:"items"`
-	UserID  int64           `json:"user_id"`
+	Name      string          `json:"name"`
+	CartToken string          `json:"cart_token"`
+	Phone     string          `json:"phone"`
+	Receive   string          `json:"receive"`
+	Comment   string          `json:"comment"`
+	Total     int             `json:"total"`
+	Items     []ShopOrderItem `json:"items"`
+	UserID    int64           `json:"user_id"`
 }
 
 type PendingOrder struct {
@@ -2161,11 +2912,10 @@ type PendingOrder struct {
 }
 
 var pendingOrders sync.Map
-var paymentTimers sync.Map
 
 func savePendingOrder(order PendingOrder) error {
 	f, err := os.OpenFile(
-		"pending-orders.jsonl",
+		dataFile("pending-orders.jsonl"),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
 		0644,
 	)
@@ -2183,9 +2933,53 @@ func productsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := os.ReadFile("products.json")
+	query := `
+		SELECT COALESCE(
+			json_agg(
+				json_build_object(
+					'id', id,
+					'section', section,
+					'category', category,
+					'name', name,
+					'price', price,
+					'price_unit', price_unit,
+					'stock', stock,
+          'available_stock',
+              CASE
+                  WHEN stock IS NULL THEN NULL
+                  ELSE GREATEST(
+                      stock - COALESCE((
+                          SELECT SUM(cr.quantity)
+                          FROM cart_reservations cr
+                          WHERE cr.product_id = products.id
+                            AND (
+                                cr.status = 'confirmed'
+                                OR (cr.status = 'active' AND cr.expires_at > now())
+                            )
+                      ), 0),
+                      0
+                  )
+              END,
+					'stock_unit', stock_unit,
+					'active', active,
+					'status', status,
+					'low_stock_threshold', low_stock_threshold,
+					'description', description,
+					'image', image,
+					'sort', sort
+				)
+				ORDER BY sort NULLS LAST, id
+			),
+			'[]'::json
+		)
+		FROM products;
+	`
+
+	var data []byte
+
+	err := dbPool.QueryRow(context.Background(), query).Scan(&data)
 	if err != nil {
-		log.Printf("products read failed: %v", err)
+		log.Printf("products query failed: %v", err)
 		http.Error(w, "products unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -2193,6 +2987,431 @@ func productsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(data)
+}
+
+type CartReserveRequest struct {
+	CartToken string  `json:"cart_token"`
+	ProductID string  `json:"product_id"`
+	Quantity  float64 `json:"quantity"`
+}
+
+func cartReserveHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req CartReserveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	req.CartToken = strings.TrimSpace(req.CartToken)
+	req.ProductID = strings.TrimSpace(req.ProductID)
+
+	if req.CartToken == "" || req.ProductID == "" || req.Quantity < 0 {
+		http.Error(w, "invalid cart or quantity", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	tx, err := dbPool.Begin(ctx)
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback(ctx)
+	if req.Quantity == 0 {
+		_, err := tx.Exec(ctx, `
+        UPDATE cart_reservations
+        SET status = 'released',
+            updated_at = now()
+        WHERE cart_token = $1
+          AND product_id = $2
+          AND status = 'active'
+    `, req.CartToken, req.ProductID)
+
+		if err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+
+		_, err = tx.Exec(ctx, `
+			UPDATE cart_reservations
+			SET expires_at = now() + interval '15 minutes',
+			    updated_at = now()
+			WHERE cart_token = $1
+			  AND status = 'active'
+			  AND expires_at > now()
+		`, req.CartToken)
+
+		if err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok": true,
+		})
+		return
+	}
+
+	var stock *float64
+	var active bool
+
+	err = tx.QueryRow(ctx, `
+		SELECT stock, active
+		FROM products
+		WHERE id = $1
+		FOR UPDATE
+	`, req.ProductID).Scan(&stock, &active)
+
+	if err != nil {
+		http.Error(w, "product not found", http.StatusNotFound)
+		return
+	}
+
+	if !active {
+		http.Error(w, "product unavailable", http.StatusConflict)
+		return
+	}
+
+	var reserved float64
+	err = tx.QueryRow(ctx, `
+		SELECT COALESCE(SUM(quantity), 0)
+		FROM cart_reservations
+		WHERE product_id = $1
+		  AND (
+          status = 'confirmed'
+          OR (status = 'active' AND expires_at > now())
+      )
+		  AND cart_token <> $2
+	`, req.ProductID, req.CartToken).Scan(&reserved)
+
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+
+	if stock != nil && reserved+req.Quantity > *stock {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":              false,
+			"available_stock": *stock - reserved,
+			"error":           "not enough stock",
+		})
+		return
+	}
+
+	_, err = tx.Exec(ctx, `
+		UPDATE cart_reservations
+		SET quantity = $1,
+		    updated_at = now(),
+		    expires_at = now() + interval '15 minutes'
+		WHERE cart_token = $2
+		  AND product_id = $3
+		  AND status = 'active'
+	`, req.Quantity, req.CartToken, req.ProductID)
+
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+
+	var exists bool
+	err = tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM cart_reservations
+			WHERE cart_token = $1
+			  AND product_id = $2
+			  AND status = 'active'
+		)
+	`, req.CartToken, req.ProductID).Scan(&exists)
+
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+
+	if !exists {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO cart_reservations
+				(cart_token, product_id, quantity, expires_at)
+			VALUES ($1, $2, $3, now() + interval '15 minutes')
+		`, req.CartToken, req.ProductID, req.Quantity)
+
+		if err != nil {
+			http.Error(w, "reservation failed", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	_, err = tx.Exec(ctx, `
+		UPDATE cart_reservations
+		SET expires_at = now() + interval '15 minutes',
+		    updated_at = now()
+		WHERE cart_token = $1
+		  AND status = 'active'
+		  AND expires_at > now()
+	`, req.CartToken)
+
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok": true,
+	})
+}
+
+func cartClearHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		CartToken string `json:"cart_token"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	req.CartToken = strings.TrimSpace(req.CartToken)
+	if req.CartToken == "" {
+		http.Error(w, "cart token is required", http.StatusBadRequest)
+		return
+	}
+
+	_, err := dbPool.Exec(r.Context(), `
+		UPDATE cart_reservations
+		SET status = 'released',
+		    updated_at = now()
+		WHERE cart_token = $1
+		  AND status = 'active'
+	`, req.CartToken)
+
+	if err != nil {
+		log.Printf("cart clear failed: %v", err)
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok": true,
+	})
+}
+
+func bindCartReservationsToOrder(cartToken, orderID string, items []ShopOrderItem) error {
+	ctx := context.Background()
+
+	cartToken = strings.TrimSpace(cartToken)
+	orderID = strings.TrimSpace(orderID)
+
+	if cartToken == "" || orderID == "" {
+		return fmt.Errorf("не указан токен корзины или номер заказа")
+	}
+
+	quantities := make(map[string]float64)
+
+	for _, item := range items {
+		id := strings.TrimSpace(item.ProductID)
+		if id == "" || item.Qty <= 0 {
+			return fmt.Errorf("некорректный товар или количество в заказе")
+		}
+		quantities[id] += item.Qty
+	}
+
+	if len(quantities) == 0 {
+		return fmt.Errorf("заказ пуст")
+	}
+
+	productIDs := make([]string, 0, len(quantities))
+	for id := range quantities {
+		productIDs = append(productIDs, id)
+	}
+
+	tx, err := dbPool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("не удалось начать транзакцию: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Блокируем товары в одинаковом порядке, чтобы избежать гонок с резервированием.
+	productRows, err := tx.Query(ctx, `
+		SELECT id, active
+		FROM products
+		WHERE id = ANY($1)
+		ORDER BY id
+		FOR UPDATE
+	`, productIDs)
+	if err != nil {
+		return fmt.Errorf("не удалось заблокировать товары: %w", err)
+	}
+
+	lockedProducts := make(map[string]bool)
+
+	for productRows.Next() {
+		var id string
+		var active bool
+
+		if err := productRows.Scan(&id, &active); err != nil {
+			productRows.Close()
+			return fmt.Errorf("ошибка проверки товара: %w", err)
+		}
+
+		lockedProducts[id] = active
+	}
+
+	if err := productRows.Err(); err != nil {
+		productRows.Close()
+		return fmt.Errorf("ошибка чтения товаров: %w", err)
+	}
+	productRows.Close()
+
+	for id := range quantities {
+		active, exists := lockedProducts[id]
+		if !exists {
+			return fmt.Errorf("товар %s не найден", id)
+		}
+		if !active {
+			return fmt.Errorf("товар %s больше недоступен", id)
+		}
+	}
+
+	// Проверяем все активные резервы этой корзины.
+	reservationRows, err := tx.Query(ctx, `
+		SELECT product_id, quantity::double precision, expires_at
+		FROM cart_reservations
+		WHERE cart_token = $1
+		  AND status = 'active'
+		ORDER BY product_id
+		FOR UPDATE
+	`, cartToken)
+	if err != nil {
+		return fmt.Errorf("не удалось проверить резервы: %w", err)
+	}
+
+	reserved := make(map[string]float64)
+
+	for reservationRows.Next() {
+		var productID string
+		var quantity float64
+		var expiresAt time.Time
+
+		if err := reservationRows.Scan(&productID, &quantity, &expiresAt); err != nil {
+			reservationRows.Close()
+			return fmt.Errorf("ошибка чтения резерва: %w", err)
+		}
+
+		if !expiresAt.After(time.Now()) {
+			reservationRows.Close()
+			return fmt.Errorf("резерв товара %s истёк. Обновите корзину", productID)
+		}
+
+		reserved[productID] += quantity
+	}
+
+	if err := reservationRows.Err(); err != nil {
+		reservationRows.Close()
+		return fmt.Errorf("ошибка чтения резервов: %w", err)
+	}
+	reservationRows.Close()
+
+	if len(reserved) != len(quantities) {
+		return fmt.Errorf("состав корзины не совпадает с резервами. Обновите страницу")
+	}
+
+	for id, quantity := range quantities {
+		reservedQuantity, exists := reserved[id]
+		if !exists || reservedQuantity < quantity-0.0005 || reservedQuantity > quantity+0.0005 {
+			return fmt.Errorf("резерв товара %s не совпадает с количеством в заказе", id)
+		}
+	}
+
+	// Привязываем резервы к заказу и продлеваем их на 30 минут.
+	_, err = tx.Exec(ctx, `
+		UPDATE cart_reservations
+		SET order_id = $2,
+		    expires_at = now() + interval '15 minutes',
+		    updated_at = now()
+		WHERE cart_token = $1
+		  AND status = 'active'
+	`, cartToken, orderID)
+	if err != nil {
+		return fmt.Errorf("не удалось привязать резервы к заказу: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("не удалось сохранить резервы: %w", err)
+	}
+
+	return nil
+}
+
+func validateOrderStock(items []ShopOrderItem) string {
+	quantities := make(map[string]float64)
+
+	for _, item := range items {
+		id := strings.TrimSpace(item.ProductID)
+
+		if id == "" {
+			return "Не удалось определить товар. Обновите страницу и попробуйте снова."
+		}
+
+		if item.Qty <= 0 {
+			return "Некорректное количество товара."
+		}
+
+		quantities[id] += item.Qty
+	}
+
+	for id, qty := range quantities {
+		var active bool
+		var stock sql.NullFloat64
+
+		err := dbPool.QueryRow(
+			context.Background(),
+			`SELECT active, stock::double precision FROM products WHERE id = $1`,
+			id,
+		).Scan(&active, &stock)
+
+		if err != nil {
+			return "Не удалось проверить наличие товара. Попробуйте позже."
+		}
+
+		if !active {
+			return "Один из товаров больше недоступен."
+		}
+
+		if stock.Valid && qty > stock.Float64 {
+			return fmt.Sprintf(
+				"Недостаточно товара на складе. Доступно: %s",
+				strconv.FormatFloat(stock.Float64, 'f', -1, 64),
+			)
+		}
+	}
+
+	return ""
 }
 
 func orderHandler(w http.ResponseWriter, r *http.Request) {
@@ -2217,7 +3436,18 @@ func orderHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	orderID := time.Now().Format("20060102-150405")
+	if strings.TrimSpace(req.CartToken) == "" {
+		http.Error(w, "cart_token is required", http.StatusBadRequest)
+		return
+	}
+
+	orderID := time.Now().Format("20060102-150405.000000000")
+
+	if err := bindCartReservationsToOrder(req.CartToken, orderID, req.Items); err != nil {
+		log.Printf("bind cart reservations failed order_id=%s: %v", orderID, err)
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
 
 	var b strings.Builder
 	b.WriteString("🛒 Новый заказ из mini-app\n")
@@ -2261,6 +3491,23 @@ func orderHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err := savePendingOrder(pendingOrder); err != nil {
 		log.Printf("save pending order failed order_id=%s: %v", orderID, err)
+
+		_, releaseErr := dbPool.Exec(
+			context.Background(),
+			`
+      UPDATE cart_reservations
+      SET status = 'released',
+          updated_at = now()
+      WHERE order_id = $1
+        AND status = 'active'
+      `,
+			orderID,
+		)
+
+		if releaseErr != nil {
+			log.Printf("release reservations failed order_id=%s: %v", orderID, releaseErr)
+		}
+
 		http.Error(w, "cannot save order", http.StatusInternalServerError)
 		return
 	}
@@ -2281,7 +3528,7 @@ type OrderConfirmRequest struct {
 }
 
 func loadPendingOrder(orderID string) (PendingOrder, error) {
-	raw, err := os.ReadFile("pending-orders.jsonl")
+	raw, err := os.ReadFile(dataFile("pending-orders.jsonl"))
 	if err != nil {
 		return PendingOrder{}, err
 	}
@@ -2308,7 +3555,7 @@ func loadPendingOrder(orderID string) (PendingOrder, error) {
 }
 
 func isOrderConfirmed(orderID string) bool {
-	raw, err := os.ReadFile("confirmed-orders.txt")
+	raw, err := os.ReadFile(dataFile("confirmed-orders.txt"))
 	if err != nil {
 		return false
 	}
@@ -2323,9 +3570,49 @@ func isOrderConfirmed(orderID string) bool {
 	return false
 }
 
+func orderPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	orderID := strings.TrimSpace(r.URL.Query().Get("order_id"))
+	if orderID == "" {
+		http.Error(w, "order_id is required", http.StatusBadRequest)
+		return
+	}
+
+	var status string
+	var hasPaymentID bool
+	var updatedAt time.Time
+
+	err := dbPool.QueryRow(
+		r.Context(),
+		`SELECT status,
+                COALESCE(payment_id, '') <> '',
+                updated_at
+         FROM yookassa_payments
+         WHERE order_id = $1`,
+		orderID,
+	).Scan(&status, &hasPaymentID, &updatedAt)
+
+	if err != nil {
+		http.Error(w, "payment not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":             true,
+		"status":         status,
+		"has_payment_id": hasPaymentID,
+		"updated_at":     updatedAt,
+	})
+}
+
 func markOrderConfirmed(orderID string) error {
 	f, err := os.OpenFile(
-		"confirmed-orders.txt",
+		dataFile("confirmed-orders.txt"),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
 		0644,
 	)
@@ -2344,97 +3631,7 @@ func markOrderConfirmed(orderID string) error {
 	return err
 }
 
-func orderConfirmHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req OrderConfirmRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad json", http.StatusBadRequest)
-		return
-	}
-
-	req.OrderID = strings.TrimSpace(req.OrderID)
-	if req.OrderID == "" {
-		http.Error(w, "order_id is required", http.StatusBadRequest)
-		return
-	}
-
-	// Защита от повторного клика по кнопке.
-	if isOrderConfirmed(req.OrderID) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"already_confirmed":true}`))
-		return
-	}
-
-	order, err := loadPendingOrder(req.OrderID)
-	if err != nil {
-		http.Error(w, "order not found", http.StatusNotFound)
-		return
-	}
-
-	// Только администраторам отправляем полный заказ
-	// и административную клавиатуру.
-	if err := sendOrderToMaxAdmins(
-		order.AdminText,
-		order.UserID,
-		order.OrderID,
-	); err != nil {
-		log.Printf(
-			"order admin message failed order_id=%s: %v",
-			order.OrderID,
-			err,
-		)
-		// Ошибка уведомления не блокирует оформление и переход к оплате.
-	}
-
-	// Клиент получает ТОЛЬКО обычный текст.
-	// Административных кнопок здесь нет.
-	if order.UserID != 0 {
-		clientText := "✅ Заказ оформлен\n\n" +
-			"Заказ № " + order.OrderID + "\n\n" +
-			"💳 Предоплата: 300 ₽\n" +
-			"Сейчас откроется Т-Банк для оплаты предоплаты.\n\n" +
-			"После оплаты ожидайте подтверждения заказа администратором.\n\n" +
-			"📦 Статус заказа: Оформлен"
-
-		if err := sendMaxMessageToUser(order.UserID, clientText); err != nil {
-			log.Printf(
-				"order client message failed user_id=%d order_id=%s: %v",
-				order.UserID,
-				order.OrderID,
-				err,
-			)
-		} else {
-			log.Printf(
-				"order client message sent user_id=%d order_id=%s",
-				order.UserID,
-				order.OrderID,
-			)
-		}
-	}
-
-	if err := markOrderConfirmed(order.OrderID); err != nil {
-		log.Printf(
-			"mark confirmed failed order_id=%s: %v",
-			order.OrderID,
-			err,
-		)
-	}
-
-	log.Printf(
-		"order confirmed by payment button order_id=%s user_id=%d",
-		order.OrderID,
-		order.UserID,
-	)
-
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"ok":true}`))
-}
-
-func paymentStartHandler(w http.ResponseWriter, r *http.Request) {
+func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -2455,59 +3652,538 @@ func paymentStartHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	v, ok := pendingOrders.Load(req.OrderID)
-	var order PendingOrder
-	
-	if ok {
-	    order = v.(PendingOrder)
-	} else {
-	    var err error
-	    order, err = loadPendingOrder(req.OrderID)
-	    if err != nil {
-	        log.Printf("payment order lookup failed order_id=%s: %v", req.OrderID, err)
-	        http.Error(w, "order not found", http.StatusNotFound)
-	        return
-	    }
-	
-	    pendingOrders.Store(req.OrderID, order)
-	}
-
-	if order.UserID == 0 {
-		http.Error(w, "MAX user_id is empty", http.StatusBadRequest)
+	_, err := loadPendingOrder(req.OrderID)
+	if err != nil {
+		http.Error(w, "order not found", http.StatusNotFound)
 		return
 	}
 
-	if _, loaded := paymentTimers.LoadOrStore(req.OrderID, true); !loaded {
-		time.AfterFunc(5*time.Minute, func() {
-			defer paymentTimers.Delete(req.OrderID)
-			defer pendingOrders.Delete(req.OrderID)
+	if isOrderConfirmed(req.OrderID) {
+		http.Error(w, "order already confirmed", http.StatusConflict)
+		return
+	}
 
-			if err := sendMaxMessageToUser(order.UserID, order.ClientText); err != nil {
-				log.Printf(
-					"delayed order message failed order_id=%s user_id=%d: %v",
-					req.OrderID,
-					order.UserID,
-					err,
-				)
+	shopID := strings.TrimSpace(os.Getenv("YOOKASSA_SHOP_ID"))
+	secretKey := strings.TrimSpace(os.Getenv("YOOKASSA_SECRET_KEY"))
+	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("PUBLIC_BASE_URL")), "/")
+
+	if shopID == "" || secretKey == "" || baseURL == "" {
+		log.Println("YooKassa configuration is incomplete")
+		http.Error(w, "payment service is not configured", http.StatusInternalServerError)
+		return
+	}
+
+	// Получаем или создаём запись платежа для этого заказа.
+	newKey, keyErr := generateIdempotenceKey()
+	if keyErr != nil {
+		http.Error(w, "payment initialization failed", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = dbPool.Exec(
+		r.Context(),
+		`INSERT INTO yookassa_payments
+      (order_id, idempotence_key, amount, status)
+    VALUES ($1, $2, 1.00, 'creating')
+    ON CONFLICT (order_id) DO NOTHING`,
+		req.OrderID,
+		newKey,
+	)
+	if err != nil {
+		log.Printf("YooKassa payment record creation failed order_id=%s: %v", req.OrderID, err)
+		http.Error(w, "payment initialization failed", http.StatusInternalServerError)
+		return
+	}
+
+	var idempotenceKey string
+	var paymentID string
+	var confirmationURL string
+	var paymentStatus string
+
+	err = dbPool.QueryRow(
+		r.Context(),
+		`SELECT idempotence_key,
+		        COALESCE(payment_id, ''),
+		        COALESCE(confirmation_url, ''),
+		        status
+		 FROM yookassa_payments
+		 WHERE order_id = $1`,
+		req.OrderID,
+	).Scan(&idempotenceKey, &paymentID, &confirmationURL, &paymentStatus)
+
+	if err != nil {
+		log.Printf("YooKassa payment record lookup failed order_id=%s: %v", req.OrderID, err)
+		http.Error(w, "payment record not found", http.StatusInternalServerError)
+		return
+	}
+
+	if confirmationURL != "" && paymentStatus != "canceled" {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":               true,
+			"confirmation_url": confirmationURL,
+		})
+		return
+	}
+
+	// Если предыдущий платёж отменён — создаём новый ключ
+	// и очищаем данные старого платежа.
+	if paymentStatus == "canceled" {
+		idempotenceKey, err = generateIdempotenceKey()
+		if err != nil {
+			log.Printf("YooKassa idempotence key generation failed: %v", err)
+			http.Error(w, "payment initialization failed", http.StatusInternalServerError)
+			return
+		}
+
+		_, err = dbPool.Exec(
+			r.Context(),
+			`UPDATE yookassa_payments
+                  SET idempotence_key = $2,
+                      payment_id = NULL,
+                      confirmation_url = NULL,
+                      status = 'creating',
+                      updated_at = now()
+                  WHERE order_id = $1
+                    AND status = 'canceled'`,
+			req.OrderID,
+			idempotenceKey,
+		)
+		if err != nil {
+			log.Printf("YooKassa canceled payment reset failed order_id=%s: %v", req.OrderID, err)
+			http.Error(w, "payment initialization failed", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Если ключ ещё не создан — генерируем его.
+	if idempotenceKey == "" {
+		idempotenceKey, err = generateIdempotenceKey()
+		if err != nil {
+			log.Printf("YooKassa idempotence key generation failed: %v", err)
+			http.Error(w, "payment initialization failed", http.StatusInternalServerError)
+			return
+		}
+
+		_, err = dbPool.Exec(
+			r.Context(),
+			`UPDATE yookassa_payments
+			 SET idempotence_key = $2,
+			     updated_at = now()
+			 WHERE order_id = $1
+			   AND idempotence_key = ''`,
+			req.OrderID,
+			idempotenceKey,
+		)
+		if err != nil {
+			log.Printf("YooKassa idempotence key save failed order_id=%s: %v", req.OrderID, err)
+			http.Error(w, "payment initialization failed", http.StatusInternalServerError)
+			return
+		}
+
+		// Повторно читаем ключ: другой параллельный запрос мог сохранить свой.
+		err = dbPool.QueryRow(
+			r.Context(),
+			`SELECT idempotence_key
+			 FROM yookassa_payments
+			 WHERE order_id = $1`,
+			req.OrderID,
+		).Scan(&idempotenceKey)
+		if err != nil {
+			http.Error(w, "payment initialization failed", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	var paymentRequest YooKassaCreateRequest
+	paymentRequest.Amount.Value = "1.00"
+	paymentRequest.Amount.Currency = "RUB"
+	paymentRequest.Capture = true
+	paymentRequest.Confirmation.Type = "redirect"
+	paymentRequest.Confirmation.ReturnURL = baseURL + "/shop?payment=return"
+	paymentRequest.Description = "Оплата доставки заказа " + req.OrderID
+	paymentRequest.Metadata = map[string]string{
+		"order_id": req.OrderID,
+	}
+
+	requestBody, err := json.Marshal(paymentRequest)
+	if err != nil {
+		http.Error(w, "payment request error", http.StatusInternalServerError)
+		return
+	}
+
+	client := &http.Client{Timeout: 20 * time.Second}
+
+	var responseData []byte
+	var responseStatusCode int
+
+	for attempt := 0; attempt < 2; attempt++ {
+		httpRequest, err := http.NewRequestWithContext(
+			r.Context(),
+			http.MethodPost,
+			"https://api.yookassa.ru/v3/payments",
+			bytes.NewReader(requestBody),
+		)
+		if err != nil {
+			http.Error(w, "payment request error", http.StatusInternalServerError)
+			return
+		}
+
+		httpRequest.SetBasicAuth(shopID, secretKey)
+		httpRequest.Header.Set("Content-Type", "application/json")
+		httpRequest.Header.Set("Idempotence-Key", idempotenceKey)
+
+		response, err := client.Do(httpRequest)
+		if err != nil {
+			log.Printf("YooKassa request failed order_id=%s: %v", req.OrderID, err)
+			http.Error(w, "payment provider unavailable", http.StatusBadGateway)
+			return
+		}
+
+		responseStatusCode = response.StatusCode
+		responseData, err = io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		response.Body.Close()
+
+		if err != nil {
+			http.Error(w, "payment response error", http.StatusBadGateway)
+			return
+		}
+
+		if responseStatusCode >= 200 && responseStatusCode < 300 {
+			break
+		}
+
+		var providerError YooKassaErrorResponse
+		_ = json.Unmarshal(responseData, &providerError)
+
+		if attempt == 0 &&
+			providerError.Code == "invalid_request" &&
+			providerError.Parameter == "Idempotence-Key" {
+
+			newKey, keyErr := generateIdempotenceKey()
+			if keyErr != nil {
+				log.Printf("YooKassa idempotence key generation failed: %v", keyErr)
+				http.Error(w, "payment initialization failed", http.StatusInternalServerError)
 				return
 			}
 
-			log.Printf(
-				"delayed order message sent order_id=%s user_id=%d",
+			tag, updateErr := dbPool.Exec(
+				r.Context(),
+				`UPDATE yookassa_payments
+              SET idempotence_key = $3,
+                  updated_at = now()
+              WHERE order_id = $1
+                AND idempotence_key = $2
+                AND status = 'creating'
+                AND payment_id IS NULL`,
 				req.OrderID,
-				order.UserID,
+				idempotenceKey,
+				newKey,
 			)
-		})
+			if updateErr != nil {
+				log.Printf("YooKassa idempotence key update failed order_id=%s: %v", req.OrderID, updateErr)
+				http.Error(w, "payment initialization failed", http.StatusInternalServerError)
+				return
+			}
 
+			if tag.RowsAffected() != 1 {
+				log.Printf("YooKassa idempotence key was changed concurrently order_id=%s", req.OrderID)
+				http.Error(w, "payment initialization conflict", http.StatusConflict)
+				return
+			}
+
+			idempotenceKey = newKey
+			continue
+		}
+
+		break
+	}
+
+	if responseStatusCode < 200 || responseStatusCode >= 300 {
 		log.Printf(
-			"payment button clicked order_id=%s user_id=%d delayed_message_in=5m",
+			"YooKassa returned HTTP %d for order_id=%s: %s",
+			responseStatusCode,
 			req.OrderID,
-			order.UserID,
+			string(responseData),
 		)
+		http.Error(w, "payment creation failed", http.StatusBadGateway)
+		return
+	}
+
+	var paymentResponse YooKassaCreateResponse
+	if err := json.Unmarshal(responseData, &paymentResponse); err != nil {
+		http.Error(w, "invalid payment response", http.StatusBadGateway)
+		return
+	}
+
+	if paymentResponse.ID == "" || paymentResponse.Confirmation.ConfirmationURL == "" {
+		http.Error(w, "payment link missing", http.StatusBadGateway)
+		return
+	}
+
+	_, err = dbPool.Exec(
+		r.Context(),
+		`UPDATE yookassa_payments
+		 SET payment_id = $2,
+		     status = $3,
+		     confirmation_url = $4,
+		     updated_at = now()
+		 WHERE order_id = $1`,
+		req.OrderID,
+		paymentResponse.ID,
+		paymentResponse.Status,
+		paymentResponse.Confirmation.ConfirmationURL,
+	)
+	if err != nil {
+		log.Printf("YooKassa payment save failed order_id=%s: %v", req.OrderID, err)
+		http.Error(w, "payment save failed", http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"ok":true}`))
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":               true,
+		"confirmation_url": paymentResponse.Confirmation.ConfirmationURL,
+	})
+}
+
+func yooKassaWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var notification YooKassaWebhookRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&notification); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+
+	// Обрабатываем только успешную или отменённую оплату.
+	if notification.Event != "payment.succeeded" &&
+		notification.Event != "payment.canceled" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	paymentID := strings.TrimSpace(notification.Object.ID)
+	if paymentID == "" {
+		http.Error(w, "payment id is empty", http.StatusBadRequest)
+		return
+	}
+
+	shopID := strings.TrimSpace(os.Getenv("YOOKASSA_SHOP_ID"))
+	secretKey := strings.TrimSpace(os.Getenv("YOOKASSA_SECRET_KEY"))
+
+	if shopID == "" || secretKey == "" {
+		log.Println("YooKassa webhook: credentials are missing")
+		http.Error(w, "payment service is not configured", http.StatusInternalServerError)
+		return
+	}
+
+	// Проверяем настоящий статус платежа через API ЮKassa.
+	apiRequest, err := http.NewRequestWithContext(
+		r.Context(),
+		http.MethodGet,
+		"https://api.yookassa.ru/v3/payments/"+url.PathEscape(paymentID),
+		nil,
+	)
+	if err != nil {
+		http.Error(w, "payment verification failed", http.StatusInternalServerError)
+		return
+	}
+
+	apiRequest.SetBasicAuth(shopID, secretKey)
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	apiResponse, err := client.Do(apiRequest)
+	if err != nil {
+		log.Printf("YooKassa verification request failed payment_id=%s: %v", paymentID, err)
+		http.Error(w, "payment provider unavailable", http.StatusBadGateway)
+		return
+	}
+	defer apiResponse.Body.Close()
+
+	if apiResponse.StatusCode != http.StatusOK {
+		log.Printf("YooKassa verification returned HTTP %d payment_id=%s", apiResponse.StatusCode, paymentID)
+		http.Error(w, "payment verification failed", http.StatusBadGateway)
+		return
+	}
+
+	var payment YooKassaPaymentDetails
+	if err := json.NewDecoder(io.LimitReader(apiResponse.Body, 1<<20)).Decode(&payment); err != nil {
+		http.Error(w, "invalid payment response", http.StatusBadGateway)
+		return
+	}
+
+	if payment.ID != paymentID {
+		http.Error(w, "payment id mismatch", http.StatusBadRequest)
+		return
+	}
+
+	amount, err := strconv.ParseFloat(payment.Amount.Value, 64)
+	if err != nil || amount != 1 || payment.Amount.Currency != "RUB" {
+		log.Printf("YooKassa invalid amount or currency payment_id=%s", paymentID)
+		http.Error(w, "invalid payment amount", http.StatusBadRequest)
+		return
+	}
+
+	orderID := strings.TrimSpace(payment.Metadata["order_id"])
+	if orderID == "" {
+		http.Error(w, "order id missing in payment metadata", http.StatusBadRequest)
+		return
+	}
+
+	if notification.Event == "payment.succeeded" && payment.Status != "succeeded" {
+		http.Error(w, "payment is not succeeded", http.StatusBadRequest)
+		return
+	}
+
+	if notification.Event == "payment.canceled" && payment.Status != "canceled" {
+		http.Error(w, "payment is not canceled", http.StatusBadRequest)
+		return
+	}
+
+	order, err := loadPendingOrder(orderID)
+	if err != nil {
+		log.Printf("YooKassa order not found order_id=%s: %v", orderID, err)
+		http.Error(w, "order not found", http.StatusNotFound)
+		return
+	}
+
+	// Проверяем привязку платежа к заказу и меняем статусы в одной транзакции.
+	tx, err := dbPool.Begin(r.Context())
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	var dbOrderID string
+	var dbPaymentStatus string
+
+	err = tx.QueryRow(
+		r.Context(),
+		`SELECT order_id, status
+		 FROM yookassa_payments
+		 WHERE payment_id = $1
+		 FOR UPDATE`,
+		paymentID,
+	).Scan(&dbOrderID, &dbPaymentStatus)
+
+	if err != nil {
+		log.Printf("YooKassa payment not found in database payment_id=%s: %v", paymentID, err)
+		http.Error(w, "payment not found", http.StatusNotFound)
+		return
+	}
+
+	if dbOrderID != orderID {
+		http.Error(w, "order id mismatch", http.StatusBadRequest)
+		return
+	}
+
+	// Повторное уведомление об уже обработанном платеже.
+	if dbPaymentStatus == payment.Status {
+		if err := tx.Commit(r.Context()); err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if notification.Event == "payment.canceled" {
+		_, err = tx.Exec(
+			r.Context(),
+			`UPDATE yookassa_payments
+      SET status = 'canceled', updated_at = now()
+      WHERE payment_id = $1`,
+			paymentID,
+		)
+		if err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+
+		// Резерв товаров сохраняем для повторной попытки оплаты.
+
+		if err := tx.Commit(r.Context()); err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+
+		log.Printf("YooKassa payment canceled; reservation kept order_id=%s", orderID)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Успешная оплата: резервируем товары до обработки заказа.
+	result, err := tx.Exec(
+		r.Context(),
+		`UPDATE cart_reservations
+		 SET status = 'confirmed', updated_at = now()
+		 WHERE order_id = $1
+		   AND status = 'active'`,
+		orderID,
+	)
+	if err != nil {
+		http.Error(w, "reservation confirmation failed", http.StatusInternalServerError)
+		return
+	}
+
+	rows := result.RowsAffected()
+	if rows == 0 {
+		log.Printf("YooKassa: no active reservations for order_id=%s", orderID)
+		http.Error(w, "order reservations not found", http.StatusConflict)
+		return
+	}
+
+	_, err = tx.Exec(
+		r.Context(),
+		`UPDATE yookassa_payments
+		 SET status = 'succeeded', updated_at = now()
+		 WHERE payment_id = $1`,
+		paymentID,
+	)
+	if err != nil {
+		http.Error(w, "payment status update failed", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+
+	// Заказ уже был подтверждён ранее — повторно не уведомляем.
+	if !isOrderConfirmed(orderID) {
+		if err := sendOrderToMaxAdmins(
+			order.AdminText,
+			order.UserID,
+			order.OrderID,
+		); err != nil {
+			log.Printf("MAX admin notification failed order_id=%s: %v", orderID, err)
+		}
+
+		if order.UserID != 0 {
+			clientText := "✅ Оплата доставки получена!\n\n" +
+				"Заказ № " + order.OrderID + "\n\n" +
+				"💳 Предоплата за доставку: 300 ₽ — оплачена.\n" +
+				"📦 Стоимость товаров оплачивается отдельно при получении.\n\n" +
+				"Заказ передан администраторам."
+
+			if err := sendMaxMessageToUser(order.UserID, clientText); err != nil {
+				log.Printf("MAX client notification failed order_id=%s: %v", orderID, err)
+			}
+		}
+
+		if err := markOrderConfirmed(orderID); err != nil {
+			log.Printf("mark confirmed failed order_id=%s: %v", orderID, err)
+		}
+	}
+
+	log.Printf("YooKassa payment succeeded order_id=%s payment_id=%s", orderID, paymentID)
+	w.WriteHeader(http.StatusOK)
 }
 
 func formatQtyServer(qty float64, unit string) string {

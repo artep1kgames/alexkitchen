@@ -1317,6 +1317,11 @@ func main() {
 			}
 
 			switch text {
+			case "/myid":
+			    if userID != 0 {
+			        sendPrivateToUser(ctx, api, userID, fmt.Sprintf("MAX ID: %d", userID), nil)
+			    }
+			    continue
 			case "/start", "старт", "Старт", "Начать", "🏠 Главное меню":
 				cancelOrder(chatID)
 				send(ctx, api, chatID, menuText(), keyboardForChat(chatID, adminChatIDs))

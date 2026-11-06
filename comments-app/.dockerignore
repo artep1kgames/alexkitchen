@@ -1,0 +1,12 @@
+﻿.env
+.env.*
+!.env.example
+*.bak
+*.log
+*.exe
+main
+comments.json
+pending-orders.jsonl
+confirmed-orders.txt
+data/
+.git/

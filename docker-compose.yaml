@@ -1,6 +1,9 @@
-﻿services:
+
+services:
   postgres:
-    image: postgres:17-alpine
+    build:
+      context: .
+      dockerfile: postgres.Dockerfile
     restart: unless-stopped
     environment:
       TZ: Europe/Moscow
@@ -9,7 +12,6 @@
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Coolify}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./comments-app/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s

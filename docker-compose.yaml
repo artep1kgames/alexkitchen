@@ -30,6 +30,7 @@ services:
       DATA_DIR: /data
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in Coolify}
       SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in Coolify}
+      ADMIN_USERS: ${ADMIN_USERS:?Set ADMIN_USERS in Coolify}
       ADMIN_CHAT_IDS: ${ADMIN_CHAT_IDS:-}
       ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
       BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN in Coolify}

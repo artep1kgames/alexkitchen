@@ -248,7 +248,7 @@ func adminMainKeyboard() *maxbot.Keyboard {
 	return kb
 }
 
-func keyboardForChat(chatID int64, adminIDs []int64) *maxbot.Keyboard {
+func keyboardForChat(chatID int64, userID int64, adminIDs []int64) *maxbot.Keyboard {
 	kb := &maxbot.Keyboard{}
 
 	row := kb.AddRow()
@@ -256,7 +256,7 @@ func keyboardForChat(chatID int64, adminIDs []int64) *maxbot.Keyboard {
 
 	isAdmin := false
 	for _, id := range adminIDs {
-		if id == chatID {
+		if id != 0 && (id == chatID || id == userID) {
 			isAdmin = true
 			break
 		}
@@ -753,7 +753,7 @@ func processOrderStep(ctx context.Context, api *maxbot.Api, adminChatIDs []int64
 
 	if text == "🏠 Главное меню" {
 		cancelOrder(chatID)
-		send(ctx, api, chatID, menuText(), keyboardForChat(chatID, adminChatIDs))
+		send(ctx, api, chatID, menuText(), keyboardForChat(chatID, userID, adminChatIDs))
 		return true
 	}
 
@@ -823,7 +823,7 @@ Chat ID: %d
 Комментарий: %s`, order.ID, userName, userID, chatID, order.Name, order.Phone, order.Products, order.Receive, order.Comment)
 }
 
-func handleOrderStatusCommand(ctx context.Context, api *maxbot.Api, adminChatIDs []int64, adminChatID int64, text string) bool {
+func handleOrderStatusCommand(ctx context.Context, api *maxbot.Api, adminChatIDs []int64, adminChatID int64, adminUserID int64, text string) bool {
 	parts := strings.Split(text, "|")
 	if len(parts) != 3 {
 		return false
@@ -832,7 +832,7 @@ func handleOrderStatusCommand(ctx context.Context, api *maxbot.Api, adminChatIDs
 	status := strings.TrimSpace(parts[0])
 	clientUserID, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
 	if err != nil || clientUserID == 0 {
-		send(ctx, api, adminChatID, "Не смог определить клиента для статуса заказа.", keyboardForChat(adminChatID, adminChatIDs))
+		send(ctx, api, adminChatID, "Не смог определить клиента для статуса заказа.", keyboardForChat(adminChatID, adminUserID, adminChatIDs))
 		return true
 	}
 	orderID := strings.TrimSpace(parts[2])
@@ -852,9 +852,9 @@ func handleOrderStatusCommand(ctx context.Context, api *maxbot.Api, adminChatIDs
 	}
 
 	if sendPrivateToUser(ctx, api, clientUserID, clientText, mainKeyboard()) {
-		send(ctx, api, adminChatID, "Готово. Клиенту отправлен статус: "+status, keyboardForChat(adminChatID, adminChatIDs))
+		send(ctx, api, adminChatID, "Готово. Клиенту отправлен статус: "+status, keyboardForChat(adminChatID, adminUserID, adminChatIDs))
 	} else {
-		send(ctx, api, adminChatID, "Не получилось отправить статус клиенту.", keyboardForChat(adminChatID, adminChatIDs))
+		send(ctx, api, adminChatID, "Не получилось отправить статус клиенту.", keyboardForChat(adminChatID, adminUserID, adminChatIDs))
 	}
 	return true
 }
@@ -1009,9 +1009,9 @@ func extractStringByFieldName(obj any, fieldNames map[string]bool) string {
 	return findStringByFieldName(reflect.ValueOf(obj), fieldNames, 0)
 }
 
-func isAdminChat(chatID int64, adminChatIDs []int64) bool {
+func isAdminChat(chatID int64, userID int64, adminChatIDs []int64) bool {
 	for _, adminChatID := range adminChatIDs {
-		if chatID != 0 && chatID == adminChatID {
+		if adminChatID != 0 && (adminChatID == chatID || adminChatID == userID) {
 			return true
 		}
 	}
@@ -1215,8 +1215,12 @@ func main() {
 
 		case *schemes.BotStartedUpdate:
 			chatID := u.ChatId
-			log.Printf("bot_started chat_id=%d", chatID)
-			send(ctx, api, chatID, menuText(), keyboardForChat(chatID, adminChatIDs))
+			userID := extractInt64ByFieldName(u, map[string]bool{
+				"UserId": true,
+				"UserID": true,
+			})
+			log.Printf("bot_started chat_id=%d user_id=%d", chatID, userID)
+			send(ctx, api, chatID, menuText(), keyboardForChat(chatID, userID, adminChatIDs))
 
 		case *schemes.UserAddedToChatUpdate:
 			// Новый пользователь добавлен в чат/паблик.
@@ -1267,7 +1271,7 @@ func main() {
 						"✅ Чек получен\n\n"+
 							"Предоплата отправлена администратору на проверку.\n\n"+
 							"После проверки мы подтвердим заказ.",
-						keyboardForChat(chatID, adminChatIDs),
+						keyboardForChat(chatID, userID, adminChatIDs),
 					)
 					continue
 				}
@@ -1283,23 +1287,23 @@ func main() {
 				}
 			}
 
-			if isAdminChat(chatID, adminChatIDs) && hasAdminPost(chatID) {
+			if isAdminChat(chatID, userID, adminChatIDs) && hasAdminPost(chatID) {
 				if strings.EqualFold(text, "отмена") || text == "❌ Отменить заказ" || text == "🏠 Главное меню" {
 					cancelAdminPost(chatID)
-					send(ctx, api, chatID, "Публикация отменена.", keyboardForChat(chatID, adminChatIDs))
+					send(ctx, api, chatID, "Публикация отменена.", keyboardForChat(chatID, userID, adminChatIDs))
 					continue
 				}
 
 				if publicChatID == 0 {
-					send(ctx, api, chatID, "PUBLIC_CHAT_ID не указан в .env — не могу опубликовать пост.", keyboardForChat(chatID, adminChatIDs))
+					send(ctx, api, chatID, "PUBLIC_CHAT_ID не указан в .env — не могу опубликовать пост.", keyboardForChat(chatID, userID, adminChatIDs))
 					continue
 				}
 
 				if sendPricePostToChannel(ctx, api, publicChatID, text, u.Message) {
 					cancelAdminPost(chatID)
-					send(ctx, api, chatID, "Готово. Пост опубликован в канал с кнопками «🛒 Наш магазин» и «💬 Обсуждение».", keyboardForChat(chatID, adminChatIDs))
+					send(ctx, api, chatID, "Готово. Пост опубликован в канал с кнопками «🛒 Наш магазин» и «💬 Обсуждение».", keyboardForChat(chatID, userID, adminChatIDs))
 				} else {
-					send(ctx, api, chatID, "Не получилось опубликовать пост. Проверьте логи и попробуйте ещё раз.", keyboardForChat(chatID, adminChatIDs))
+					send(ctx, api, chatID, "Не получилось опубликовать пост. Проверьте логи и попробуйте ещё раз.", keyboardForChat(chatID, userID, adminChatIDs))
 				}
 				continue
 			}
@@ -1308,7 +1312,7 @@ func main() {
 				continue
 			}
 
-			if isAdminChat(chatID, adminChatIDs) && handleOrderStatusCommand(ctx, api, adminChatIDs, chatID, text) {
+			if isAdminChat(chatID, userID, adminChatIDs) && handleOrderStatusCommand(ctx, api, adminChatIDs, chatID, userID, text) {
 				continue
 			}
 
@@ -1318,23 +1322,23 @@ func main() {
 
 			switch text {
 			case "/myid":
-			    if userID != 0 {
-			        sendPrivateToUser(ctx, api, userID, fmt.Sprintf("MAX ID: %d", userID), nil)
-			    }
-			    continue
+				if userID != 0 {
+					sendPrivateToUser(ctx, api, userID, fmt.Sprintf("MAX ID: %d", userID), nil)
+				}
+				continue
 			case "/start", "старт", "Старт", "Начать", "🏠 Главное меню":
 				cancelOrder(chatID)
-				send(ctx, api, chatID, menuText(), keyboardForChat(chatID, adminChatIDs))
+				send(ctx, api, chatID, menuText(), keyboardForChat(chatID, userID, adminChatIDs))
 
 			case "📋 Каталог", "Каталог", "каталог", "меню", "Меню":
-				send(ctx, api, chatID, "Чтобы посмотреть товары и оформить заказ — откройте магазин ниже 👇", keyboardForChat(chatID, adminChatIDs))
+				send(ctx, api, chatID, "Чтобы посмотреть товары и оформить заказ — откройте магазин ниже 👇", keyboardForChat(chatID, userID, adminChatIDs))
 
 			case "🛒 Сделать заказ", "🛒 Заказ", "Заказ", "заказ":
 				cancelOrder(chatID)
-				send(ctx, api, chatID, "Заказ теперь оформляется через mini-app. Откройте магазин ниже 👇", keyboardForChat(chatID, adminChatIDs))
+				send(ctx, api, chatID, "Заказ теперь оформляется через mini-app. Откройте магазин ниже 👇", keyboardForChat(chatID, userID, adminChatIDs))
 
 			case "📝 Пост в канал", "пост", "Пост", "пост в канал", "Пост в канал":
-				if !isAdminChat(chatID, adminChatIDs) {
+				if !isAdminChat(chatID, userID, adminChatIDs) {
 					send(ctx, api, chatID, "Эта команда доступна только администратору.", mainKeyboard())
 					continue
 				}
@@ -1343,14 +1347,14 @@ func main() {
 				send(ctx, api, chatID, adminPostInstructionText(), cancelKeyboard())
 
 			case "🚚 Доставка", "Доставка", "доставка":
-				send(ctx, api, chatID, "Информация о товарах, доставке и заказе доступна в магазине 👇", keyboardForChat(chatID, adminChatIDs))
+				send(ctx, api, chatID, "Информация о товарах, доставке и заказе доступна в магазине 👇", keyboardForChat(chatID, userID, adminChatIDs))
 
 			case "💬 Администратор", "💬 Связь", "Связь", "админ", "Админ":
-				send(ctx, api, chatID, "Сообщение администратору можно написать прямо сюда. Для заказа откройте магазин 👇", keyboardForChat(chatID, adminChatIDs))
+				send(ctx, api, chatID, "Сообщение администратору можно написать прямо сюда. Для заказа откройте магазин 👇", keyboardForChat(chatID, userID, adminChatIDs))
 
 			case "❌ Отменить заказ":
 				cancelOrder(chatID)
-				send(ctx, api, chatID, "Заказ отменён. Для нового заказа откройте магазин 👇", keyboardForChat(chatID, adminChatIDs))
+				send(ctx, api, chatID, "Заказ отменён. Для нового заказа откройте магазин 👇", keyboardForChat(chatID, userID, adminChatIDs))
 
 			default:
 				if section := findSectionByButton(text); section != nil {
@@ -1358,7 +1362,7 @@ func main() {
 					continue
 				}
 
-				send(ctx, api, chatID, "Здравствуйте! 👋\n\nЧтобы посмотреть каталог и оформить заказ — откройте магазин ниже 👇", keyboardForChat(chatID, adminChatIDs))
+				send(ctx, api, chatID, "Здравствуйте! 👋\n\nЧтобы посмотреть каталог и оформить заказ — откройте магазин ниже 👇", keyboardForChat(chatID, userID, adminChatIDs))
 			}
 
 		case *schemes.MessageEditedUpdate:

@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 )
@@ -194,6 +195,38 @@ func initDB() {
 	}
 
 	log.Println("PostgreSQL подключён успешно")
+
+	// Таблицы заказов и доставок уведомлений хранят состояние в PostgreSQL.
+	// Это исключает зависимость новых заказов от локальных JSONL/TXT-файлов.
+	_, err = dbPool.Exec(context.Background(), `
+		CREATE TABLE IF NOT EXISTS shop_orders (
+			order_id text PRIMARY KEY,
+			payload jsonb NOT NULL,
+			status text NOT NULL DEFAULT 'awaiting_payment',
+			created_at timestamptz NOT NULL DEFAULT now(),
+			updated_at timestamptz NOT NULL DEFAULT now()
+		)
+	`)
+	if err != nil {
+		log.Fatalf("Не удалось подготовить таблицу заказов: %v", err)
+	}
+
+	_, err = dbPool.Exec(context.Background(), `
+		CREATE TABLE IF NOT EXISTS order_notification_deliveries (
+			order_id text NOT NULL,
+			recipient text NOT NULL,
+			status text NOT NULL DEFAULT 'pending',
+			lease_until timestamptz,
+			sent_at timestamptz,
+			last_error text,
+			updated_at timestamptz NOT NULL DEFAULT now(),
+			PRIMARY KEY (order_id, recipient),
+			CHECK (status IN ('pending', 'sending', 'sent'))
+		)
+	`)
+	if err != nil {
+		log.Fatalf("Не удалось подготовить таблицу уведомлений: %v", err)
+	}
 }
 
 func main() {
@@ -2475,14 +2508,21 @@ async function checkReturnedPayment(){
 
         if(data.status === "succeeded"){
           cart = [];
+          cartExpiresAt = 0;
           localStorage.removeItem("alex_pending_order_id");
+          localStorage.removeItem("alex_cart");
+          localStorage.removeItem("alex_cart_expires_at");
 
           cartToken = crypto.randomUUID();
           localStorage.setItem("alex_cart_token", cartToken);
 
           updateCart();
 
-          alert("Предоплата 300 ₽ получена. Корзина очищена.");
+          if(data.order_status === "paid_needs_review"){
+            alert("Оплата получена. Срок резерва товаров истёк, поэтому мы проверим наличие и свяжемся с вами для подтверждения заказа.");
+          } else {
+            alert("Предоплата 300 ₽ получена. Корзина очищена.");
+          }
 
           const url = new URL(window.location.href);
           url.searchParams.delete("payment");
@@ -2553,12 +2593,9 @@ function sendCartOrder(){
         e.preventDefault();
         e.stopPropagation();
       }
-      alert("Кнопка подтверждения нажалась");
       finishOrder();
       return false;
     };
-  } else {
-    alert("Кнопка подтверждения не найдена");
   }
 }
 
@@ -2911,20 +2948,19 @@ type PendingOrder struct {
 	AdminText  string          `json:"admin_text"`
 }
 
-var pendingOrders sync.Map
-
 func savePendingOrder(order PendingOrder) error {
-	f, err := os.OpenFile(
-		dataFile("pending-orders.jsonl"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
-		0644,
-	)
+	payload, err := json.Marshal(order)
 	if err != nil {
-		return err
+		return fmt.Errorf("не удалось сериализовать заказ: %w", err)
 	}
-	defer f.Close()
-
-	return json.NewEncoder(f).Encode(order)
+	_, err = dbPool.Exec(context.Background(), `
+		INSERT INTO shop_orders (order_id, payload, status)
+		VALUES ($1, $2::jsonb, 'awaiting_payment')
+	`, order.OrderID, string(payload))
+	if err != nil {
+		return fmt.Errorf("не удалось сохранить заказ в PostgreSQL: %w", err)
+	}
+	return nil
 }
 
 func productsHandler(w http.ResponseWriter, r *http.Request) {
@@ -3221,197 +3257,186 @@ func cartClearHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func bindCartReservationsToOrder(cartToken, orderID string, items []ShopOrderItem) error {
-	ctx := context.Background()
+func calculateOrderLine(price float64, priceUnit string, qty float64) (int, error) {
+	if strings.TrimSpace(priceUnit) == "" {
+		priceUnit = "шт"
+	}
+	if price < 0 || qty <= 0 || math.IsNaN(price) || math.IsInf(price, 0) || math.IsNaN(qty) || math.IsInf(qty, 0) {
+		return 0, fmt.Errorf("некорректная цена или количество")
+	}
 
+	var raw float64
+	switch strings.ToLower(strings.TrimSpace(priceUnit)) {
+	case "кг", "л", "шт":
+		raw = price * qty
+	case "100 г":
+		raw = price * qty / 100
+	case "50 г":
+		raw = price * qty / 50
+	default:
+		return 0, fmt.Errorf("неподдерживаемая единица цены %q", priceUnit)
+	}
+	if raw > float64(math.MaxInt) {
+		return 0, fmt.Errorf("слишком большая сумма заказа")
+	}
+	return int(math.Round(raw)), nil
+}
+
+func orderQuantityUnit(priceUnit string) string {
+	if strings.TrimSpace(priceUnit) == "" {
+		priceUnit = "шт"
+	}
+	switch strings.ToLower(strings.TrimSpace(priceUnit)) {
+	case "100 г", "50 г":
+		return "г"
+	default:
+		return strings.TrimSpace(priceUnit)
+	}
+}
+
+func bindCartReservationsToOrder(cartToken, orderID string, items []ShopOrderItem) ([]ShopOrderItem, int, error) {
+	ctx := context.Background()
 	cartToken = strings.TrimSpace(cartToken)
 	orderID = strings.TrimSpace(orderID)
-
 	if cartToken == "" || orderID == "" {
-		return fmt.Errorf("не указан токен корзины или номер заказа")
+		return nil, 0, fmt.Errorf("не указан токен корзины или номер заказа")
 	}
 
 	quantities := make(map[string]float64)
-
 	for _, item := range items {
 		id := strings.TrimSpace(item.ProductID)
-		if id == "" || item.Qty <= 0 {
-			return fmt.Errorf("некорректный товар или количество в заказе")
+		if id == "" || item.Qty <= 0 || math.IsNaN(item.Qty) || math.IsInf(item.Qty, 0) {
+			return nil, 0, fmt.Errorf("некорректный товар или количество в заказе")
 		}
 		quantities[id] += item.Qty
 	}
-
 	if len(quantities) == 0 {
-		return fmt.Errorf("заказ пуст")
+		return nil, 0, fmt.Errorf("заказ пуст")
 	}
 
 	productIDs := make([]string, 0, len(quantities))
 	for id := range quantities {
 		productIDs = append(productIDs, id)
 	}
+	sort.Strings(productIDs)
 
 	tx, err := dbPool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("не удалось начать транзакцию: %w", err)
+		return nil, 0, fmt.Errorf("не удалось начать транзакцию: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	// Блокируем товары в одинаковом порядке, чтобы избежать гонок с резервированием.
-	productRows, err := tx.Query(ctx, `
-		SELECT id, active
-		FROM products
-		WHERE id = ANY($1)
-		ORDER BY id
-		FOR UPDATE
+	// Блокируем товары и одновременно читаем единственные доверенные цены/названия.
+	rows, err := tx.Query(ctx, `
+		SELECT id, name, price::double precision, COALESCE(price_unit, ''), active
+		FROM products WHERE id = ANY($1) ORDER BY id FOR UPDATE
 	`, productIDs)
 	if err != nil {
-		return fmt.Errorf("не удалось заблокировать товары: %w", err)
+		return nil, 0, fmt.Errorf("не удалось проверить товары: %w", err)
 	}
 
-	lockedProducts := make(map[string]bool)
-
-	for productRows.Next() {
+	type productData struct {
+		name, priceUnit string
+		price           float64
+		active          bool
+	}
+	catalog := make(map[string]productData, len(productIDs))
+	for rows.Next() {
 		var id string
-		var active bool
-
-		if err := productRows.Scan(&id, &active); err != nil {
-			productRows.Close()
-			return fmt.Errorf("ошибка проверки товара: %w", err)
+		var item productData
+		if err := rows.Scan(&id, &item.name, &item.price, &item.priceUnit, &item.active); err != nil {
+			rows.Close()
+			return nil, 0, fmt.Errorf("ошибка чтения товара: %w", err)
 		}
+		catalog[id] = item
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, 0, fmt.Errorf("ошибка чтения товаров: %w", err)
+	}
+	rows.Close()
 
-		lockedProducts[id] = active
+	normalized := make([]ShopOrderItem, 0, len(items))
+	total := 0
+	for _, clientItem := range items {
+		id := strings.TrimSpace(clientItem.ProductID)
+		product, ok := catalog[id]
+		if !ok {
+			return nil, 0, fmt.Errorf("товар %s не найден", id)
+		}
+		if !product.active {
+			return nil, 0, fmt.Errorf("товар %s больше недоступен", product.name)
+		}
+		line, err := calculateOrderLine(product.price, product.priceUnit, clientItem.Qty)
+		if err != nil {
+			return nil, 0, fmt.Errorf("товар %s: %w", product.name, err)
+		}
+		if total > math.MaxInt-line {
+			return nil, 0, fmt.Errorf("слишком большая сумма заказа")
+		}
+		total += line
+		normalized = append(normalized, ShopOrderItem{
+			ProductID: id,
+			Name:      product.name,
+			Price:     strconv.FormatFloat(product.price, 'f', -1, 64) + " ₽/" + product.priceUnit,
+			Qty:       clientItem.Qty,
+			Unit:      orderQuantityUnit(product.priceUnit),
+			Line:      line,
+		})
 	}
 
-	if err := productRows.Err(); err != nil {
-		productRows.Close()
-		return fmt.Errorf("ошибка чтения товаров: %w", err)
-	}
-	productRows.Close()
-
-	for id := range quantities {
-		active, exists := lockedProducts[id]
-		if !exists {
-			return fmt.Errorf("товар %s не найден", id)
-		}
-		if !active {
-			return fmt.Errorf("товар %s больше недоступен", id)
-		}
-	}
-
-	// Проверяем все активные резервы этой корзины.
+	// Проверяем резервы именно этой корзины; истёкшие резервы нельзя привязать к заказу.
 	reservationRows, err := tx.Query(ctx, `
 		SELECT product_id, quantity::double precision, expires_at
 		FROM cart_reservations
-		WHERE cart_token = $1
-		  AND status = 'active'
-		ORDER BY product_id
-		FOR UPDATE
+		WHERE cart_token = $1 AND status = 'active'
+		ORDER BY product_id FOR UPDATE
 	`, cartToken)
 	if err != nil {
-		return fmt.Errorf("не удалось проверить резервы: %w", err)
+		return nil, 0, fmt.Errorf("не удалось проверить резервы: %w", err)
 	}
-
 	reserved := make(map[string]float64)
-
 	for reservationRows.Next() {
 		var productID string
 		var quantity float64
 		var expiresAt time.Time
-
 		if err := reservationRows.Scan(&productID, &quantity, &expiresAt); err != nil {
 			reservationRows.Close()
-			return fmt.Errorf("ошибка чтения резерва: %w", err)
+			return nil, 0, fmt.Errorf("ошибка чтения резерва: %w", err)
 		}
-
 		if !expiresAt.After(time.Now()) {
 			reservationRows.Close()
-			return fmt.Errorf("резерв товара %s истёк. Обновите корзину", productID)
+			return nil, 0, fmt.Errorf("резерв товара %s истёк. Обновите корзину", productID)
 		}
-
 		reserved[productID] += quantity
 	}
-
 	if err := reservationRows.Err(); err != nil {
 		reservationRows.Close()
-		return fmt.Errorf("ошибка чтения резервов: %w", err)
+		return nil, 0, fmt.Errorf("ошибка чтения резервов: %w", err)
 	}
 	reservationRows.Close()
-
 	if len(reserved) != len(quantities) {
-		return fmt.Errorf("состав корзины не совпадает с резервами. Обновите страницу")
+		return nil, 0, fmt.Errorf("состав корзины не совпадает с резервами. Обновите страницу")
 	}
-
 	for id, quantity := range quantities {
 		reservedQuantity, exists := reserved[id]
 		if !exists || reservedQuantity < quantity-0.0005 || reservedQuantity > quantity+0.0005 {
-			return fmt.Errorf("резерв товара %s не совпадает с количеством в заказе", id)
+			return nil, 0, fmt.Errorf("резерв товара %s не совпадает с количеством в заказе", id)
 		}
 	}
 
-	// Привязываем резервы к заказу и продлеваем их на 30 минут.
 	_, err = tx.Exec(ctx, `
 		UPDATE cart_reservations
-		SET order_id = $2,
-		    expires_at = now() + interval '15 minutes',
-		    updated_at = now()
-		WHERE cart_token = $1
-		  AND status = 'active'
+		SET order_id = $2, expires_at = now() + interval '15 minutes', updated_at = now()
+		WHERE cart_token = $1 AND status = 'active'
 	`, cartToken, orderID)
 	if err != nil {
-		return fmt.Errorf("не удалось привязать резервы к заказу: %w", err)
+		return nil, 0, fmt.Errorf("не удалось привязать резервы к заказу: %w", err)
 	}
-
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("не удалось сохранить резервы: %w", err)
+		return nil, 0, fmt.Errorf("не удалось сохранить резервы: %w", err)
 	}
-
-	return nil
-}
-
-func validateOrderStock(items []ShopOrderItem) string {
-	quantities := make(map[string]float64)
-
-	for _, item := range items {
-		id := strings.TrimSpace(item.ProductID)
-
-		if id == "" {
-			return "Не удалось определить товар. Обновите страницу и попробуйте снова."
-		}
-
-		if item.Qty <= 0 {
-			return "Некорректное количество товара."
-		}
-
-		quantities[id] += item.Qty
-	}
-
-	for id, qty := range quantities {
-		var active bool
-		var stock sql.NullFloat64
-
-		err := dbPool.QueryRow(
-			context.Background(),
-			`SELECT active, stock::double precision FROM products WHERE id = $1`,
-			id,
-		).Scan(&active, &stock)
-
-		if err != nil {
-			return "Не удалось проверить наличие товара. Попробуйте позже."
-		}
-
-		if !active {
-			return "Один из товаров больше недоступен."
-		}
-
-		if stock.Valid && qty > stock.Float64 {
-			return fmt.Sprintf(
-				"Недостаточно товара на складе. Доступно: %s",
-				strconv.FormatFloat(stock.Float64, 'f', -1, 64),
-			)
-		}
-	}
-
-	return ""
+	return normalized, total, nil
 }
 
 func orderHandler(w http.ResponseWriter, r *http.Request) {
@@ -3443,11 +3468,15 @@ func orderHandler(w http.ResponseWriter, r *http.Request) {
 
 	orderID := time.Now().Format("20060102-150405.000000000")
 
-	if err := bindCartReservationsToOrder(req.CartToken, orderID, req.Items); err != nil {
+	serverItems, serverTotal, err := bindCartReservationsToOrder(req.CartToken, orderID, req.Items)
+	if err != nil {
 		log.Printf("bind cart reservations failed order_id=%s: %v", orderID, err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
+	// Не доверяем названиям, ценам, единицам и итогу, присланным браузером.
+	req.Items = serverItems
+	req.Total = serverTotal
 
 	var b strings.Builder
 	b.WriteString("🛒 Новый заказ из mini-app\n")
@@ -3523,51 +3552,39 @@ func orderHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"ok":true,"order_id":"` + orderID + `"}`))
 }
 
-type OrderConfirmRequest struct {
-	OrderID string `json:"order_id"`
-}
-
 func loadPendingOrder(orderID string) (PendingOrder, error) {
-	raw, err := os.ReadFile(dataFile("pending-orders.jsonl"))
-	if err != nil {
-		return PendingOrder{}, err
+	var payload string
+	err := dbPool.QueryRow(context.Background(), `
+		SELECT payload::text FROM shop_orders WHERE order_id = $1
+	`, orderID).Scan(&payload)
+	if err == nil {
+		var order PendingOrder
+		if err := json.Unmarshal([]byte(payload), &order); err != nil {
+			return PendingOrder{}, fmt.Errorf("ошибка чтения заказа из PostgreSQL: %w", err)
+		}
+		return order, nil
+	}
+	if err != pgx.ErrNoRows {
+		return PendingOrder{}, fmt.Errorf("ошибка поиска заказа в PostgreSQL: %w", err)
 	}
 
+	// Совместимость со старыми заказами, созданными до перехода на PostgreSQL.
+	raw, fileErr := os.ReadFile(dataFile("pending-orders.jsonl"))
+	if fileErr != nil {
+		return PendingOrder{}, fmt.Errorf("order not found")
+	}
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
 		}
-
 		var order PendingOrder
-		if err := json.Unmarshal([]byte(line), &order); err != nil {
-			continue
-		}
-
-		if order.OrderID == orderID {
+		if json.Unmarshal([]byte(line), &order) == nil && order.OrderID == orderID {
 			return order, nil
 		}
 	}
-
 	return PendingOrder{}, fmt.Errorf("order not found")
-}
-
-func isOrderConfirmed(orderID string) bool {
-	raw, err := os.ReadFile(dataFile("confirmed-orders.txt"))
-	if err != nil {
-		return false
-	}
-
-	for _, line := range strings.Split(string(raw), "\n") {
-		parts := strings.Fields(strings.TrimSpace(line))
-		if len(parts) > 0 && parts[0] == orderID {
-			return true
-		}
-	}
-
-	return false
 }
 
 func orderPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -3585,16 +3602,23 @@ func orderPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 	var status string
 	var hasPaymentID bool
 	var updatedAt time.Time
+	var orderStatus string
 
 	err := dbPool.QueryRow(
 		r.Context(),
-		`SELECT status,
-                COALESCE(payment_id, '') <> '',
-                updated_at
-         FROM yookassa_payments
-         WHERE order_id = $1`,
+		`SELECT yp.status,
+                COALESCE(yp.payment_id, '') <> '',
+                yp.updated_at,
+                COALESCE(so.status, CASE
+                    WHEN EXISTS (SELECT 1 FROM cart_reservations cr WHERE cr.order_id = yp.order_id AND cr.status = 'confirmed') THEN 'paid'
+                    WHEN yp.status = 'succeeded' THEN 'paid_needs_review'
+                    ELSE ''
+                END)
+         FROM yookassa_payments yp
+         LEFT JOIN shop_orders so ON so.order_id = yp.order_id
+         WHERE yp.order_id = $1`,
 		orderID,
-	).Scan(&status, &hasPaymentID, &updatedAt)
+	).Scan(&status, &hasPaymentID, &updatedAt, &orderStatus)
 
 	if err != nil {
 		http.Error(w, "payment not found", http.StatusNotFound)
@@ -3607,28 +3631,8 @@ func orderPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 		"status":         status,
 		"has_payment_id": hasPaymentID,
 		"updated_at":     updatedAt,
+		"order_status":   orderStatus,
 	})
-}
-
-func markOrderConfirmed(orderID string) error {
-	f, err := os.OpenFile(
-		dataFile("confirmed-orders.txt"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
-		0644,
-	)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = fmt.Fprintf(
-		f,
-		"%s %s\n",
-		orderID,
-		time.Now().Format(time.RFC3339),
-	)
-
-	return err
 }
 
 func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
@@ -3655,11 +3659,6 @@ func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 	_, err := loadPendingOrder(req.OrderID)
 	if err != nil {
 		http.Error(w, "order not found", http.StatusNotFound)
-		return
-	}
-
-	if isOrderConfirmed(req.OrderID) {
-		http.Error(w, "order already confirmed", http.StatusConflict)
 		return
 	}
 
@@ -3714,6 +3713,11 @@ func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("YooKassa payment record lookup failed order_id=%s: %v", req.OrderID, err)
 		http.Error(w, "payment record not found", http.StatusInternalServerError)
+		return
+	}
+
+	if paymentStatus == "succeeded" {
+		http.Error(w, "payment already succeeded", http.StatusConflict)
 		return
 	}
 
@@ -3947,6 +3951,125 @@ func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func claimOrderNotification(ctx context.Context, orderID, recipient string) (bool, error) {
+	_, err := dbPool.Exec(ctx, `
+		INSERT INTO order_notification_deliveries (order_id, recipient, status)
+		VALUES ($1, $2, 'pending') ON CONFLICT (order_id, recipient) DO NOTHING
+	`, orderID, recipient)
+	if err != nil {
+		return false, err
+	}
+	var claimed string
+	err = dbPool.QueryRow(ctx, `
+		UPDATE order_notification_deliveries
+		SET status = 'sending', lease_until = now() + interval '2 minutes', updated_at = now()
+		WHERE order_id = $1 AND recipient = $2
+		  AND status <> 'sent'
+		  AND (status = 'pending' OR (status = 'sending' AND lease_until < now()))
+		RETURNING recipient
+	`, orderID, recipient).Scan(&claimed)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func finishOrderNotification(ctx context.Context, orderID, recipient string, sendErr error) error {
+	if sendErr == nil {
+		_, err := dbPool.Exec(ctx, `
+			UPDATE order_notification_deliveries
+			SET status = 'sent', sent_at = now(), lease_until = NULL, last_error = NULL, updated_at = now()
+			WHERE order_id = $1 AND recipient = $2
+		`, orderID, recipient)
+		return err
+	}
+	_, err := dbPool.Exec(ctx, `
+		UPDATE order_notification_deliveries
+		SET status = 'pending', lease_until = NULL, last_error = $3, updated_at = now()
+		WHERE order_id = $1 AND recipient = $2 AND status = 'sending'
+	`, orderID, recipient, sendErr.Error())
+	return err
+}
+
+func sendOrderNotifications(order PendingOrder, reservationConfirmed bool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("MAX_BOT_TOKEN"))
+	}
+	if token == "" {
+		return fmt.Errorf("BOT_TOKEN / MAX_BOT_TOKEN is empty")
+	}
+
+	adminText := order.AdminText
+	clientText := "✅ Оплата доставки получена!\n\n" +
+		"Заказ № " + order.OrderID + "\n\n" +
+		"💳 Предоплата за доставку: 300 ₽ — оплачена.\n" +
+		"📦 Стоимость товаров оплачивается отдельно при получении.\n\n" +
+		"Заказ передан администраторам."
+	if !reservationConfirmed {
+		adminText = "⚠️ ОПЛАТА ПОЛУЧЕНА, НО РЕЗЕРВ ТОВАРОВ ИСТЁК. НУЖНА РУЧНАЯ ПРОВЕРКА НАЛИЧИЯ.\n\n" + adminText
+		clientText = "✅ Оплата получена.\n\nЗаказ № " + order.OrderID + "\n\n" +
+			"Срок резерва товаров истёк, поэтому мы дополнительно проверим наличие и свяжемся с вами для подтверждения заказа."
+	}
+
+	rawAdmins := strings.TrimSpace(os.Getenv("ADMIN_CHAT_IDS"))
+	if rawAdmins == "" {
+		rawAdmins = strings.TrimSpace(os.Getenv("ADMIN_CHAT_ID"))
+	}
+	if rawAdmins == "" {
+		return fmt.Errorf("ADMIN_CHAT_ID / ADMIN_CHAT_IDS is empty")
+	}
+	var failures []string
+	admins := strings.FieldsFunc(rawAdmins, func(r rune) bool { return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\t' })
+	for _, raw := range admins {
+		chatID, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		if err != nil {
+			failures = append(failures, "invalid admin chat id: "+raw)
+			continue
+		}
+		recipient := "chat:" + strconv.FormatInt(chatID, 10)
+		claimed, err := claimOrderNotification(ctx, order.OrderID, recipient)
+		if err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		if !claimed {
+			continue
+		}
+		sendErr := sendMaxMessage(token, chatID, adminText, orderStatusKeyboard(order.UserID, order.OrderID))
+		if err := finishOrderNotification(ctx, order.OrderID, recipient, sendErr); err != nil {
+			failures = append(failures, err.Error())
+		}
+		if sendErr != nil {
+			failures = append(failures, sendErr.Error())
+		}
+	}
+	if order.UserID != 0 {
+		recipient := "user:" + strconv.FormatInt(order.UserID, 10)
+		claimed, err := claimOrderNotification(ctx, order.OrderID, recipient)
+		if err != nil {
+			failures = append(failures, err.Error())
+		} else if claimed {
+			sendErr := sendMaxMessageToUserWithAttachments(token, order.UserID, clientText, nil)
+			if err := finishOrderNotification(ctx, order.OrderID, recipient, sendErr); err != nil {
+				failures = append(failures, err.Error())
+			}
+			if sendErr != nil {
+				failures = append(failures, sendErr.Error())
+			}
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("notification delivery incomplete: %s", strings.Join(failures, "; "))
+	}
+	return nil
+}
+
 func yooKassaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -4082,17 +4205,19 @@ func yooKassaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Повторное уведомление об уже обработанном платеже.
-	if dbPaymentStatus == payment.Status {
-		if err := tx.Commit(r.Context()); err != nil {
-			http.Error(w, "database error", http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		return
-	}
+	// Повторный webhook не меняет платёж повторно, но ниже повторно проверит
+	// недоставленные уведомления. Успешные доставки защищены таблицей outbox.
+	alreadySucceeded := dbPaymentStatus == "succeeded" && payment.Status == "succeeded"
 
 	if notification.Event == "payment.canceled" {
+		if dbPaymentStatus == "succeeded" {
+			if err := tx.Commit(r.Context()); err != nil {
+				http.Error(w, "database error", http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		_, err = tx.Exec(
 			r.Context(),
 			`UPDATE yookassa_payments
@@ -4106,6 +4231,10 @@ func yooKassaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Резерв товаров сохраняем для повторной попытки оплаты.
+		_, _ = tx.Exec(r.Context(), `
+			UPDATE shop_orders SET status = 'awaiting_payment', updated_at = now()
+			WHERE order_id = $1
+		`, orderID)
 
 		if err := tx.Commit(r.Context()); err != nil {
 			http.Error(w, "database error", http.StatusInternalServerError)
@@ -4117,37 +4246,88 @@ func yooKassaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Успешная оплата: резервируем товары до обработки заказа.
-	result, err := tx.Exec(
-		r.Context(),
-		`UPDATE cart_reservations
-		 SET status = 'confirmed', updated_at = now()
-		 WHERE order_id = $1
-		   AND status = 'active'`,
-		orderID,
-	)
+	// Блокируем строки товаров в том же порядке, что и обработчик резерва.
+	lockRows, err := tx.Query(r.Context(), `
+		SELECT p.id
+		FROM products p
+		JOIN cart_reservations cr ON cr.product_id = p.id
+		WHERE cr.order_id = $1 AND cr.status = 'active'
+		ORDER BY p.id
+		FOR UPDATE OF p
+	`, orderID)
 	if err != nil {
-		http.Error(w, "reservation confirmation failed", http.StatusInternalServerError)
+		http.Error(w, "reservation lock failed", http.StatusInternalServerError)
+		return
+	}
+	for lockRows.Next() {
+		var ignoredProductID string
+		if err := lockRows.Scan(&ignoredProductID); err != nil {
+			lockRows.Close()
+			http.Error(w, "reservation lock failed", http.StatusInternalServerError)
+			return
+		}
+	}
+	if err := lockRows.Err(); err != nil {
+		lockRows.Close()
+		http.Error(w, "reservation lock failed", http.StatusInternalServerError)
+		return
+	}
+	lockRows.Close()
+
+	var activeReservations, validReservations, confirmedReservations int
+	err = tx.QueryRow(r.Context(), `
+		SELECT
+			COUNT(*) FILTER (WHERE status = 'active'),
+			COUNT(*) FILTER (WHERE status = 'active' AND expires_at > now()),
+			COUNT(*) FILTER (WHERE status = 'confirmed')
+		FROM cart_reservations
+		WHERE order_id = $1
+	`, orderID).Scan(&activeReservations, &validReservations, &confirmedReservations)
+	if err != nil {
+		http.Error(w, "reservation check failed", http.StatusInternalServerError)
+		return
+	}
+	reservationConfirmed := (confirmedReservations > 0 && activeReservations == 0) || (confirmedReservations == 0 && activeReservations > 0 && activeReservations == validReservations)
+	if reservationConfirmed {
+		_, err = tx.Exec(r.Context(), `
+			UPDATE cart_reservations SET status = 'confirmed', updated_at = now()
+			WHERE order_id = $1 AND status = 'active' AND expires_at > now()
+		`, orderID)
+	} else {
+		// Оплата уже прошла: не отклоняем webhook и не возвращаем резерв,
+		// который мог быть выдан другой корзине. Требуем ручной проверки.
+		_, err = tx.Exec(r.Context(), `
+			UPDATE cart_reservations SET status = 'released', updated_at = now()
+			WHERE order_id = $1 AND status = 'active'
+		`, orderID)
+	}
+	if err != nil {
+		http.Error(w, "reservation processing failed", http.StatusInternalServerError)
 		return
 	}
 
-	rows := result.RowsAffected()
-	if rows == 0 {
-		log.Printf("YooKassa: no active reservations for order_id=%s", orderID)
-		http.Error(w, "order reservations not found", http.StatusConflict)
+	orderStatus := "paid_needs_review"
+	if reservationConfirmed {
+		orderStatus = "paid"
+	}
+	_, err = tx.Exec(r.Context(), `
+		UPDATE shop_orders SET status = $2, updated_at = now()
+		WHERE order_id = $1
+	`, orderID, orderStatus)
+	if err != nil {
+		http.Error(w, "order status update failed", http.StatusInternalServerError)
 		return
 	}
 
-	_, err = tx.Exec(
-		r.Context(),
-		`UPDATE yookassa_payments
-		 SET status = 'succeeded', updated_at = now()
-		 WHERE payment_id = $1`,
-		paymentID,
-	)
-	if err != nil {
-		http.Error(w, "payment status update failed", http.StatusInternalServerError)
-		return
+	if !alreadySucceeded {
+		_, err = tx.Exec(r.Context(), `
+			UPDATE yookassa_payments SET status = 'succeeded', updated_at = now()
+			WHERE payment_id = $1
+		`, paymentID)
+		if err != nil {
+			http.Error(w, "payment status update failed", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	if err := tx.Commit(r.Context()); err != nil {
@@ -4155,31 +4335,12 @@ func yooKassaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Заказ уже был подтверждён ранее — повторно не уведомляем.
-	if !isOrderConfirmed(orderID) {
-		if err := sendOrderToMaxAdmins(
-			order.AdminText,
-			order.UserID,
-			order.OrderID,
-		); err != nil {
-			log.Printf("MAX admin notification failed order_id=%s: %v", orderID, err)
-		}
-
-		if order.UserID != 0 {
-			clientText := "✅ Оплата доставки получена!\n\n" +
-				"Заказ № " + order.OrderID + "\n\n" +
-				"💳 Предоплата за доставку: 300 ₽ — оплачена.\n" +
-				"📦 Стоимость товаров оплачивается отдельно при получении.\n\n" +
-				"Заказ передан администраторам."
-
-			if err := sendMaxMessageToUser(order.UserID, clientText); err != nil {
-				log.Printf("MAX client notification failed order_id=%s: %v", orderID, err)
-			}
-		}
-
-		if err := markOrderConfirmed(orderID); err != nil {
-			log.Printf("mark confirmed failed order_id=%s: %v", orderID, err)
-		}
+	if err := sendOrderNotifications(order, reservationConfirmed); err != nil {
+		// Возвращаем 500, чтобы YooKassa повторила webhook; уже отправленные
+		// адресатам сообщения повторно не уйдут благодаря таблице доставок.
+		log.Printf("MAX notification delivery incomplete order_id=%s: %v", orderID, err)
+		http.Error(w, "notification delivery incomplete", http.StatusInternalServerError)
+		return
 	}
 
 	log.Printf("YooKassa payment succeeded order_id=%s payment_id=%s", orderID, paymentID)
@@ -4208,66 +4369,6 @@ func formatQtyServer(qty float64, unit string) string {
 
 func formatRubServer(n int) string {
 	return strconv.Itoa(n) + " ₽"
-}
-
-func sendOrderToMaxAdmins(text string, userID int64, orderID string) error {
-	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
-	if token == "" {
-		token = strings.TrimSpace(os.Getenv("MAX_BOT_TOKEN"))
-	}
-	if token == "" {
-		return fmt.Errorf("BOT_TOKEN / MAX_BOT_TOKEN is empty")
-	}
-
-	rawAdmins := strings.TrimSpace(os.Getenv("ADMIN_CHAT_IDS"))
-	if rawAdmins == "" {
-		rawAdmins = strings.TrimSpace(os.Getenv("ADMIN_CHAT_ID"))
-	}
-	if rawAdmins == "" {
-		return fmt.Errorf("ADMIN_CHAT_ID / ADMIN_CHAT_IDS is empty")
-	}
-
-	admins := strings.FieldsFunc(rawAdmins, func(r rune) bool {
-		return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\t'
-	})
-
-	var lastErr error
-	for _, a := range admins {
-		a = strings.TrimSpace(a)
-		if a == "" {
-			continue
-		}
-
-		chatID, err := strconv.ParseInt(a, 10, 64)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		if err := sendMaxMessage(
-			token,
-			chatID,
-			text,
-			orderStatusKeyboard(userID, orderID),
-		); err != nil {
-			log.Printf(
-				"order admin message failed chat_id=%d order_id=%s: %v",
-				chatID,
-				orderID,
-				err,
-			)
-			lastErr = err
-			continue
-		}
-
-		log.Printf(
-			"order admin message sent chat_id=%d order_id=%s",
-			chatID,
-			orderID,
-		)
-	}
-
-	return lastErr
 }
 
 func orderStatusKeyboard(userID int64, orderID string) []any {

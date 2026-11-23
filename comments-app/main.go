@@ -12,6 +12,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -226,6 +227,24 @@ func initDB() {
 	`)
 	if err != nil {
 		log.Fatalf("Не удалось подготовить таблицу уведомлений: %v", err)
+	}
+
+	// Таблица платежей нужна локальному и серверному запуску.
+	// Если она уже существует, данные и текущие платежи не затрагиваются.
+	_, err = dbPool.Exec(context.Background(), `
+		CREATE TABLE IF NOT EXISTS yookassa_payments (
+			order_id text PRIMARY KEY,
+			idempotence_key text NOT NULL DEFAULT '',
+			amount numeric(12,2) NOT NULL DEFAULT 1.00,
+			status text NOT NULL DEFAULT 'creating',
+			payment_id text UNIQUE,
+			confirmation_url text,
+			created_at timestamptz NOT NULL DEFAULT now(),
+			updated_at timestamptz NOT NULL DEFAULT now()
+		)
+	`)
+	if err != nil {
+		log.Fatalf("Не удалось подготовить таблицу платежей ЮKassa: %v", err)
 	}
 }
 
@@ -488,9 +507,7 @@ body{
 .checkout-field{width:100%;box-sizing:border-box;border:1px solid #dde3ea;border-radius:16px;padding:14px 16px;font-size:17px;margin-top:10px;}
 .checkout-label{font-size:15px;font-weight:900;color:#6f7785;margin-top:14px;}
 .checkout-total{background:#111;color:#fff;border-radius:18px;padding:16px;margin:14px 0;font-size:20px;font-weight:900;}
-.checkout-choice{display:flex;gap:10px;margin-top:10px;}
-.checkout-choice button{flex:1;height:46px;border:0;border-radius:16px;background:#eef0f3;color:#111;font-size:16px;font-weight:900;}
-.checkout-choice button.active{background:#1688f8;color:#fff;}
+.checkout-choice{display:flex;gap:10px;margin-top:10px;}.checkout-choice button{flex:1;min-height:64px;border:2px solid #d9dee7;border-radius:16px;background:#f4f6f8;color:#303846;font-size:15px;font-weight:900;padding:9px 7px;line-height:1.25;transition:background .15s,border-color .15s,transform .15s;}.checkout-choice button small{display:block;font-size:11px;font-weight:700;opacity:.85;margin-top:4px;}.checkout-choice button.pickup-active{background:#e8f7ee;border-color:#159447;color:#126b35;box-shadow:0 0 0 2px rgba(21,148,71,.12);}.checkout-choice button.delivery-active{background:#fff2df;border-color:#e28a17;color:#8a4b00;box-shadow:0 0 0 2px rgba(226,138,23,.12);}
 
 .cart-panel{width:100%;max-height:88vh;overflow:auto;background:#fff;border-radius:30px 30px 0 0;padding:22px 18px;box-sizing:border-box;}
 .cart-title{font-size:28px;font-weight:700;margin-bottom:4px;color:#4f5663;text-align:center;}
@@ -1173,9 +1190,7 @@ body{margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,BlinkMacSys
 .checkout-field{width:100%;box-sizing:border-box;border:1px solid #dde3ea;border-radius:16px;padding:14px 16px;font-size:17px;margin-top:10px}
 .checkout-label{font-size:15px;font-weight:900;color:#6f7785;margin-top:14px}
 .checkout-total{background:#111;color:#fff;border-radius:18px;padding:16px;margin:14px 0;font-size:20px;font-weight:900}
-.checkout-choice{display:flex;gap:10px;margin-top:10px}
-.checkout-choice button{flex:1;height:46px;border:0;border-radius:16px;background:#eef0f3;color:#111;font-size:16px;font-weight:900}
-.checkout-choice button.active{background:#1688f8;color:#fff}
+.checkout-choice{display:flex;gap:10px;margin-top:10px;}.checkout-choice button{flex:1;min-height:64px;border:2px solid #d9dee7;border-radius:16px;background:#f4f6f8;color:#303846;font-size:15px;font-weight:900;padding:9px 7px;line-height:1.25;transition:background .15s,border-color .15s,transform .15s;}.checkout-choice button small{display:block;font-size:11px;font-weight:700;opacity:.85;margin-top:4px;}.checkout-choice button.pickup-active{background:#e8f7ee;border-color:#159447;color:#126b35;box-shadow:0 0 0 2px rgba(21,148,71,.12);}.checkout-choice button.delivery-active{background:#fff2df;border-color:#e28a17;color:#8a4b00;box-shadow:0 0 0 2px rgba(226,138,23,.12);}
 
 .cart-panel{width:100%;max-height:88vh;overflow:auto;background:#fff;border-radius:30px 30px 0 0;padding:22px 18px;box-sizing:border-box;}
 .cart-title{font-size:28px;font-weight:700;margin-bottom:4px;color:#4f5663;text-align:center;}
@@ -2044,7 +2059,7 @@ function openCart(){
       html += '</div>';
     }
 
-    html += '<div class="cart-summary">Итого: ' + escapeHtml(formatMoney(calcCartTotal())) + '<br><span style="font-size:15px">Предоплата: 300 ₽</span></div>';
+    html += '<div class="cart-summary">Итого: ' + escapeHtml(formatMoney(calcCartTotal())) + '</div>';
   }
 
   html += '<button class="cart-submit" onclick="sendCartOrder()">Оформить заказ</button>';
@@ -2362,25 +2377,67 @@ function setReceiveType(type){
   const p = document.getElementById("pickupBtn");
   const d = document.getElementById("deliveryBtn");
   if(p && d){
-    p.className = type === "Самовывоз" ? "active" : "";
-    d.className = type === "Доставка" ? "active" : "";
+    p.className = type === "Самовывоз" ? "pickup-active" : "";
+    d.className = type === "Доставка" ? "delivery-active" : "";
+    p.setAttribute("aria-pressed", type === "Самовывоз" ? "true" : "false");
+    d.setAttribute("aria-pressed", type === "Доставка" ? "true" : "false");
+  }
+  const paymentInfo = document.getElementById("checkoutPaymentInfo");
+  if(paymentInfo){
+    paymentInfo.textContent = type === "Самовывоз"
+      ? "🟢 Самовывоз: онлайн-оплата не нужна. Товары оплачиваются при получении."
+      : "🟠 Доставка: перед подтверждением нужно оплатить доставку (тест — 1 ₽). Товары оплачиваются при получении.";
+  }
+  const finishBtn = document.getElementById("finishOrderBtn");
+  if(finishBtn){
+    finishBtn.textContent = type === "Самовывоз"
+      ? "Подтвердить самовывоз без оплаты"
+      : "Создать заказ и перейти к оплате 1 ₽";
+    finishBtn.style.background = type === "Самовывоз" ? "#159447" : "#e28a17";
+    finishBtn.style.color = type === "Самовывоз" ? "#fff" : "#241600";
+  }
+  const emailField = document.getElementById("checkoutEmailField");
+  if(emailField){
+    emailField.style.display = type === "Доставка" ? "block" : "none";
   }
 }
 
 async function finishOrder(){
-  const pendingOrderID = localStorage.getItem("alex_pending_order_id");
-
-  if(pendingOrderID){
-    payWithYooKassa(pendingOrderID);
-    return;
-  }
-
   const name = document.getElementById("clientName").value.trim();
   const phone = document.getElementById("clientPhone").value.trim();
+  const email = document.getElementById("clientEmail").value.trim();
   const comment = document.getElementById("clientComment").value.trim();
+
+  // Старый ID ожидающей доставки не должен перехватывать оформление самовывоза.
+  if(receiveType === "Самовывоз"){
+    localStorage.removeItem("alex_pending_order_id");
+  } else {
+    const pendingOrderID = localStorage.getItem("alex_pending_order_id");
+    if(pendingOrderID){
+      if(!email){
+        setReceiveType("Доставка");
+        alert("Введите email для электронного чека");
+        document.getElementById("clientEmail").focus();
+        return;
+      }
+      // Для доставки разрешаем повторить оплату уже созданного заказа.
+      await payWithYooKassa(pendingOrderID, email);
+      return;
+    }
+  }
 
   if(!name){ alert("Введите имя"); return; }
   if(!phone){ alert("Введите телефон"); return; }
+  if(receiveType === "Доставка" && !email){
+    alert("Введите email — на него ЮKassa отправит электронный чек");
+    document.getElementById("clientEmail").focus();
+    return;
+  }
+  if(receiveType === "Доставка" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){
+    alert("Проверьте правильность email");
+    document.getElementById("clientEmail").focus();
+    return;
+  }
 
   const items = cart.map(function(x){
     return {
@@ -2405,6 +2462,7 @@ async function finishOrder(){
     name: name,
     cart_token: cartToken,
     phone: phone,
+    email: email,
     receive: receiveType,
     comment: comment,
     total: calcCartTotal(),
@@ -2427,10 +2485,23 @@ async function finishOrder(){
 
     const data = await res.json();
 
-    localStorage.setItem("alex_pending_order_id", data.order_id);
-
-    updateCart();
     closeCart();
+
+    const isPickup = receiveType === "Самовывоз";
+    if(isPickup){
+      // Самовывоз не требует онлайн-оплаты: заказ уже сохранён,
+      // а сервер подтвердил резерв товаров.
+      localStorage.removeItem("alex_pending_order_id");
+      cart = [];
+      cartExpiresAt = 0;
+      localStorage.removeItem("alex_cart");
+      localStorage.removeItem("alex_cart_expires_at");
+      cartToken = crypto.randomUUID();
+      localStorage.setItem("alex_cart_token", cartToken);
+      updateCart();
+    } else {
+      localStorage.setItem("alex_pending_order_id", data.order_id);
+    }
 
     const modal = document.createElement("div");
     modal.id = "cartModal";
@@ -2439,12 +2510,16 @@ async function finishOrder(){
       + '<div style="font-size:42px;margin-bottom:12px;">✅</div>'
       + '<div class="cart-title">Спасибо за заказ!</div>'
       + '<div style="font-size:16px;line-height:1.5;color:#333;margin:14px 0;">'
-      + 'Заказ создан. Для передачи заказа администратору внесите предоплату.<br>В ближайшее время мы свяжемся с вами для подтверждения.'
+      + (isPickup
+          ? 'Заказ на самовывоз создан. Оплатить товары можно будет при получении. Онлайн-оплата не требуется.'
+          : 'Заказ на доставку создан. Для проверки необходимо выполнить тестовую оплату 1 ₽. Стоимость товаров оплачивается при получении.')
+      + '<br>В ближайшее время мы свяжемся с вами для подтверждения.'
       + '</div>'
-      + '<div style="background:#f5f5f5;border-radius:18px;padding:14px;margin:14px 0;font-size:15px;line-height:1.45;">'
-      + 'Для бронирования заказа необходимо внести предоплату <b>300 ₽</b>.<br><br>'
-      + '<button type="button" onclick="payWithYooKassa(\'' + data.order_id + '\')" style="width:100%;height:54px;border:0;border-radius:18px;background:#ffdd2d;color:#111;font-size:17px;font-weight:900;">Оплатить 300 ₽</button>'
-      + '</div>'
+      + (isPickup ? ''
+          : '<div style="background:#f5f5f5;border-radius:18px;padding:14px;margin:14px 0;font-size:15px;line-height:1.45;">'
+            + 'Выполните тестовую оплату 1 ₽, чтобы проверить работу ЮKassa.<br><br>'
+            + '<button type="button" onclick="payWithYooKassa(\'' + data.order_id + '\')" style="width:100%;height:54px;border:0;border-radius:18px;background:#ffdd2d;color:#111;font-size:17px;font-weight:900;">Оплатить 1 ₽</button>'
+            + '</div>')
       + '<button class="cart-submit" onclick="location.reload()">Вернуться в магазин</button>'
       + '</div>';
     document.body.appendChild(modal);
@@ -2456,12 +2531,12 @@ async function finishOrder(){
 
 
 
-async function payWithYooKassa(orderID){
+async function payWithYooKassa(orderID, email){
   try{
     const res = await fetch("/api/order/pay", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({order_id: orderID})
+      body: JSON.stringify({order_id: orderID, email: email || ""})
     });
 
     const responseText = await res.text();
@@ -2521,7 +2596,7 @@ async function checkReturnedPayment(){
           if(data.order_status === "paid_needs_review"){
             alert("Оплата получена. Срок резерва товаров истёк, поэтому мы проверим наличие и свяжемся с вами для подтверждения заказа.");
           } else {
-            alert("Предоплата 300 ₽ получена. Корзина очищена.");
+            alert("Тестовая оплата 1 ₽ получена. Корзина очищена.");
           }
 
           const url = new URL(window.location.href);
@@ -2562,7 +2637,7 @@ function sendCartOrder(){
 
   let html = '<div class="cart-panel">';
   html += '<div class="cart-title">Оформление заказа</div>';
-  html += '<div class="checkout-total">Итого: ' + formatMoney(calcCartTotal()) + '<br><span style="font-size:15px">Предоплата: 300 ₽</span></div>';
+  html += '<div class="checkout-total">Итого: ' + formatMoney(calcCartTotal()) + '<br><span id="checkoutPaymentInfo" style="font-size:15px">Оплата при получении. Онлайн-платёж не требуется.</span></div>';
 
   html += '<div class="checkout-label">Ваше имя</div>';
   html += '<input id="clientName" class="checkout-field" placeholder="Например, Алексей">';
@@ -2570,21 +2645,27 @@ function sendCartOrder(){
   html += '<div class="checkout-label">Телефон</div>';
   html += '<input id="clientPhone" class="checkout-field" placeholder="+7..." inputmode="tel">';
 
+  html += '<div id="checkoutEmailField" style="display:none">';
+  html += '<div class="checkout-label">Email для электронного чека</div>';
+  html += '<input id="clientEmail" class="checkout-field" type="email" placeholder="example@mail.ru" autocomplete="email">';
+  html += '</div>';
+
   html += '<div class="checkout-label">Получение</div>';
   html += '<div class="checkout-choice">';
-  html += '<button id="pickupBtn" class="active" onclick="setReceiveType(\'Самовывоз\')">Самовывоз</button>';
-  html += '<button id="deliveryBtn" onclick="setReceiveType(\'Доставка\')">Доставка</button>';
+  html += '<button type="button" id="pickupBtn" class="pickup-active" aria-pressed="true" onclick="setReceiveType(\'Самовывоз\')">📍 Самовывоз<small>Без онлайн-оплаты</small></button>';
+  html += '<button type="button" id="deliveryBtn" aria-pressed="false" onclick="setReceiveType(\'Доставка\')">🚚 Доставка<small>Оплата доставки 1 ₽*</small></button>';
   html += '</div>';
 
   html += '<div class="checkout-label">Комментарий</div>';
   html += '<textarea id="clientComment" class="checkout-field" rows="3" placeholder="Например: заберу вечером, нужен звонок"></textarea>';
 
-  html += '<button class="cart-submit" id="finishOrderBtn" type="button">Подтвердить заказ</button>';
+  html += '<button class="cart-submit" id="finishOrderBtn" type="button" style="background:#159447;color:#fff">Подтвердить самовывоз без оплаты</button>';
   html += '<button class="cart-close" onclick="openCart()">Назад в корзину</button>';
   html += '</div>';
 
   modal.innerHTML = html;
   document.body.appendChild(modal);
+  setReceiveType(receiveType);
 
   const finishBtn = document.getElementById("finishOrderBtn");
   if(finishBtn){
@@ -2733,9 +2814,7 @@ p{color:#667085;font-size:16px}
 .checkout-field{width:100%;box-sizing:border-box;border:1px solid #dde3ea;border-radius:16px;padding:14px 16px;font-size:17px;margin-top:10px;}
 .checkout-label{font-size:15px;font-weight:900;color:#6f7785;margin-top:14px;}
 .checkout-total{background:#111;color:#fff;border-radius:18px;padding:16px;margin:14px 0;font-size:20px;font-weight:900;}
-.checkout-choice{display:flex;gap:10px;margin-top:10px;}
-.checkout-choice button{flex:1;height:46px;border:0;border-radius:16px;background:#eef0f3;color:#111;font-size:16px;font-weight:900;}
-.checkout-choice button.active{background:#1688f8;color:#fff;}
+.checkout-choice{display:flex;gap:10px;margin-top:10px;}.checkout-choice button{flex:1;min-height:64px;border:2px solid #d9dee7;border-radius:16px;background:#f4f6f8;color:#303846;font-size:15px;font-weight:900;padding:9px 7px;line-height:1.25;transition:background .15s,border-color .15s,transform .15s;}.checkout-choice button small{display:block;font-size:11px;font-weight:700;opacity:.85;margin-top:4px;}.checkout-choice button.pickup-active{background:#e8f7ee;border-color:#159447;color:#126b35;box-shadow:0 0 0 2px rgba(21,148,71,.12);}.checkout-choice button.delivery-active{background:#fff2df;border-color:#e28a17;color:#8a4b00;box-shadow:0 0 0 2px rgba(226,138,23,.12);}
 
 .cart-panel{width:100%;max-height:88vh;overflow:auto;background:#fff;border-radius:30px 30px 0 0;padding:22px 18px;box-sizing:border-box;}
 .cart-title{font-size:28px;font-weight:700;margin-bottom:4px;color:#4f5663;text-align:center;}
@@ -2884,6 +2963,26 @@ type YooKassaCreateRequest struct {
 
 	Description string            `json:"description"`
 	Metadata    map[string]string `json:"metadata"`
+	Receipt     YooKassaReceipt   `json:"receipt"`
+}
+
+type YooKassaReceipt struct {
+	Customer struct {
+		Email string `json:"email"`
+	} `json:"customer"`
+	Items []YooKassaReceiptItem `json:"items"`
+}
+
+type YooKassaReceiptItem struct {
+	Description string `json:"description"`
+	Quantity    string `json:"quantity"`
+	Amount      struct {
+		Value    string `json:"value"`
+		Currency string `json:"currency"`
+	} `json:"amount"`
+	VATCode        int    `json:"vat_code"`
+	PaymentMode    string `json:"payment_mode"`
+	PaymentSubject string `json:"payment_subject"`
 }
 
 type YooKassaCreateResponse struct {
@@ -2925,6 +3024,7 @@ type ShopOrderRequest struct {
 	Name      string          `json:"name"`
 	CartToken string          `json:"cart_token"`
 	Phone     string          `json:"phone"`
+	Email     string          `json:"email"`
 	Receive   string          `json:"receive"`
 	Comment   string          `json:"comment"`
 	Total     int             `json:"total"`
@@ -2941,6 +3041,7 @@ type PendingOrder struct {
 	UserID     int64           `json:"user_id"`
 	Name       string          `json:"name"`
 	Phone      string          `json:"phone"`
+	Email      string          `json:"email,omitempty"`
 	Receive    string          `json:"receive"`
 	Comment    string          `json:"comment,omitempty"`
 	Total      int             `json:"total"`
@@ -2953,10 +3054,14 @@ func savePendingOrder(order PendingOrder) error {
 	if err != nil {
 		return fmt.Errorf("не удалось сериализовать заказ: %w", err)
 	}
+	status := strings.TrimSpace(order.Status)
+	if status == "" {
+		status = "awaiting_payment"
+	}
 	_, err = dbPool.Exec(context.Background(), `
 		INSERT INTO shop_orders (order_id, payload, status)
-		VALUES ($1, $2::jsonb, 'awaiting_payment')
-	`, order.OrderID, string(payload))
+		VALUES ($1, $2::jsonb, $3)
+	`, order.OrderID, string(payload), status)
 	if err != nil {
 		return fmt.Errorf("не удалось сохранить заказ в PostgreSQL: %w", err)
 	}
@@ -3453,12 +3558,24 @@ func orderHandler(w http.ResponseWriter, r *http.Request) {
 
 	req.Name = strings.TrimSpace(req.Name)
 	req.Phone = strings.TrimSpace(req.Phone)
+	req.Email = strings.TrimSpace(req.Email)
 	req.Receive = strings.TrimSpace(req.Receive)
 	req.Comment = strings.TrimSpace(req.Comment)
 
 	if req.Name == "" || req.Phone == "" || len(req.Items) == 0 {
 		http.Error(w, "name, phone and items are required", http.StatusBadRequest)
 		return
+	}
+	if req.Receive != "Самовывоз" && req.Receive != "Доставка" {
+		http.Error(w, "receive must be Самовывоз or Доставка", http.StatusBadRequest)
+		return
+	}
+	if req.Receive == "Доставка" {
+		parsedEmail, emailErr := mail.ParseAddress(req.Email)
+		if emailErr != nil || parsedEmail.Address != req.Email || !strings.Contains(req.Email, ".") {
+			http.Error(w, "для доставки укажите корректный email для электронного чека", http.StatusBadRequest)
+			return
+		}
 	}
 
 	if strings.TrimSpace(req.CartToken) == "" {
@@ -3495,22 +3612,34 @@ func orderHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	b.WriteString("\n💰 Итого: " + formatRubServer(req.Total) + "\n")
-	b.WriteString("💳 Предоплата: 300 ₽\n")
+	if req.Receive == "Самовывоз" {
+		b.WriteString("💳 Оплата: при получении (онлайн-оплаты нет)\n")
+	} else {
+		b.WriteString("💳 Доставка: онлайн-оплата (сейчас тестовый платёж 1 ₽; рабочая стоимость доставки — 300 ₽)\n")
+		b.WriteString("🥩 Стоимость товаров оплачивается при получении\n")
+	}
 
 	if req.Comment != "" {
 		b.WriteString("\n💬 Комментарий: " + req.Comment + "\n")
 	}
 
-	// До подтверждения оплаты заказ никому в MAX не отправляем.
-	// Сохраняем заказ со статусом ожидания предоплаты.
+	// Для доставки ждём оплату доставки; самовывоз подтверждается сразу.
+	// Сохраняем заказ до отправки уведомлений в MAX.
+	orderStatus := "awaiting_payment"
+	prepayment := 1 // Временная тестовая сумма онлайн-оплаты доставки; перед запуском заменить на 300.
+	if req.Receive == "Самовывоз" {
+		orderStatus = "created"
+		prepayment = 0
+	}
 	pendingOrder := PendingOrder{
 		OrderID:    orderID,
 		CreatedAt:  time.Now().Format(time.RFC3339),
-		Status:     "awaiting_payment",
-		Prepayment: 300,
+		Status:     orderStatus,
+		Prepayment: prepayment,
 		UserID:     req.UserID,
 		Name:       req.Name,
 		Phone:      req.Phone,
+		Email:      req.Email,
 		Receive:    req.Receive,
 		Comment:    req.Comment,
 		Total:      req.Total,
@@ -3541,12 +3670,52 @@ func orderHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf(
-		"order awaiting payment order_id=%s user_id=%d total=%d",
-		orderID,
-		req.UserID,
-		req.Total,
-	)
+	if req.Receive == "Самовывоз" {
+		// Самовывоз подтверждается без онлайн-платежа: удерживаем товары
+		// за заказом до ручного завершения/отмены заказа администратором.
+		tx, txErr := dbPool.Begin(r.Context())
+		if txErr != nil {
+			log.Printf("pickup order transaction start failed order_id=%s: %v", orderID, txErr)
+			http.Error(w, "не удалось подтвердить заказ", http.StatusInternalServerError)
+			return
+		}
+		tag, confirmErr := tx.Exec(r.Context(), `
+			UPDATE cart_reservations
+			SET status = 'confirmed', updated_at = now()
+			WHERE order_id = $1 AND status = 'active'
+		`, orderID)
+		if confirmErr != nil || tag.RowsAffected() == 0 {
+			_ = tx.Rollback(r.Context())
+			log.Printf("pickup reservation confirmation failed order_id=%s err=%v rows=%d", orderID, confirmErr, tag.RowsAffected())
+			http.Error(w, "не удалось подтвердить резерв заказа", http.StatusInternalServerError)
+			return
+		}
+		if _, statusErr := tx.Exec(r.Context(), `
+			UPDATE shop_orders SET status = 'created', updated_at = now()
+			WHERE order_id = $1
+		`, orderID); statusErr != nil {
+			_ = tx.Rollback(r.Context())
+			log.Printf("pickup order status update failed order_id=%s: %v", orderID, statusErr)
+			http.Error(w, "не удалось обновить статус заказа", http.StatusInternalServerError)
+			return
+		}
+		if commitErr := tx.Commit(r.Context()); commitErr != nil {
+			log.Printf("pickup order transaction commit failed order_id=%s: %v", orderID, commitErr)
+			http.Error(w, "не удалось подтвердить заказ", http.StatusInternalServerError)
+			return
+		}
+		if notifyErr := sendOrderNotifications(pendingOrder, true); notifyErr != nil {
+			log.Printf("pickup MAX notification delivery incomplete order_id=%s: %v", orderID, notifyErr)
+		}
+		log.Printf("pickup order created without online payment order_id=%s user_id=%d total=%d", orderID, req.UserID, req.Total)
+	} else {
+		log.Printf(
+			"delivery order awaiting payment order_id=%s user_id=%d total=%d",
+			orderID,
+			req.UserID,
+			req.Total,
+		)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"ok":true,"order_id":"` + orderID + `"}`))
@@ -3643,6 +3812,7 @@ func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		OrderID string `json:"order_id"`
+		Email   string `json:"email"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -3656,10 +3826,39 @@ func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := loadPendingOrder(req.OrderID)
+	order, err := loadPendingOrder(req.OrderID)
 	if err != nil {
 		http.Error(w, "order not found", http.StatusNotFound)
 		return
+	}
+	if order.Receive != "Доставка" {
+		http.Error(w, "онлайн-оплата доступна только для доставки", http.StatusBadRequest)
+		return
+	}
+
+	// Старые ожидающие заказы могли быть созданы до появления поля email.
+	// Берём email из сохранённого заказа, а для старого заказа — из запроса оплаты.
+	legacyOrderWithoutEmail := strings.TrimSpace(order.Email) == ""
+	if legacyOrderWithoutEmail {
+		req.Email = strings.TrimSpace(req.Email)
+		parsedEmail, emailErr := mail.ParseAddress(req.Email)
+		if emailErr != nil || parsedEmail.Address != req.Email || !strings.Contains(req.Email, ".") {
+			http.Error(w, "для оплаты укажите корректный email для электронного чека", http.StatusBadRequest)
+			return
+		}
+		order.Email = req.Email
+		payload, marshalErr := json.Marshal(order)
+		if marshalErr != nil {
+			http.Error(w, "не удалось сохранить email заказа", http.StatusInternalServerError)
+			return
+		}
+		if _, updateErr := dbPool.Exec(r.Context(),
+			`UPDATE shop_orders SET payload = $2::jsonb, updated_at = now() WHERE order_id = $1`,
+			req.OrderID, string(payload)); updateErr != nil {
+			log.Printf("YooKassa order email save failed order_id=%s: %v", req.OrderID, updateErr)
+			http.Error(w, "не удалось сохранить email заказа", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	shopID := strings.TrimSpace(os.Getenv("YOOKASSA_SHOP_ID"))
@@ -3719,6 +3918,23 @@ func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 	if paymentStatus == "succeeded" {
 		http.Error(w, "payment already succeeded", http.StatusConflict)
 		return
+	}
+
+	// У старого заказа предыдущий запрос уже мог получить 400 из-за отсутствующего чека.
+	// Новый состав запроса отправляем с новым Idempotence-Key, не меняя сам заказ.
+	if legacyOrderWithoutEmail && paymentID == "" && paymentStatus == "creating" {
+		idempotenceKey, err = generateIdempotenceKey()
+		if err != nil {
+			http.Error(w, "payment initialization failed", http.StatusInternalServerError)
+			return
+		}
+		if _, err = dbPool.Exec(r.Context(),
+			`UPDATE yookassa_payments SET idempotence_key = $2, updated_at = now() WHERE order_id = $1 AND payment_id IS NULL`,
+			req.OrderID, idempotenceKey); err != nil {
+			log.Printf("YooKassa legacy idempotence key rotation failed order_id=%s: %v", req.OrderID, err)
+			http.Error(w, "payment initialization failed", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	if confirmationURL != "" && paymentStatus != "canceled" {
@@ -3805,10 +4021,24 @@ func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 	paymentRequest.Capture = true
 	paymentRequest.Confirmation.Type = "redirect"
 	paymentRequest.Confirmation.ReturnURL = baseURL + "/shop?payment=return"
-	paymentRequest.Description = "Оплата доставки заказа " + req.OrderID
+	paymentRequest.Description = "Тестовая оплата доставки (1 ₽), заказ " + req.OrderID
 	paymentRequest.Metadata = map[string]string{
 		"order_id": req.OrderID,
 	}
+
+	// Тестовая операция на 1 ₽: формируем отдельную позицию чека,
+	// не выдавая её за фактическую стоимость доставки 300 ₽.
+	paymentRequest.Receipt.Customer.Email = order.Email
+	testReceiptItem := YooKassaReceiptItem{
+		Description:    "Тестовая оплата доставки заказа " + req.OrderID,
+		Quantity:       "1.00",
+		VATCode:        1, // Без НДС
+		PaymentMode:    "full_payment",
+		PaymentSubject: "service",
+	}
+	testReceiptItem.Amount.Value = "1.00"
+	testReceiptItem.Amount.Currency = "RUB"
+	paymentRequest.Receipt.Items = []YooKassaReceiptItem{testReceiptItem}
 
 	requestBody, err := json.Marshal(paymentRequest)
 	if err != nil {
@@ -4006,14 +4236,20 @@ func sendOrderNotifications(order PendingOrder, reservationConfirmed bool) error
 	}
 
 	adminText := order.AdminText
-	clientText := "✅ Оплата доставки получена!\n\n" +
+	clientText := "✅ Тестовая оплата 1 ₽ получена!\n\n" +
 		"Заказ № " + order.OrderID + "\n\n" +
-		"💳 Предоплата за доставку: 300 ₽ — оплачена.\n" +
+		"💳 Тестовая оплата 1 ₽ получена.\n" +
 		"📦 Стоимость товаров оплачивается отдельно при получении.\n\n" +
 		"Заказ передан администраторам."
+	if order.Receive == "Самовывоз" {
+		clientText = "✅ Заказ на самовывоз создан!\n\n" +
+			"Заказ № " + order.OrderID + "\n\n" +
+			"📍 Оплата товаров — при получении. Онлайн-оплата не требуется.\n\n" +
+			"Заказ передан администраторам. Мы свяжемся с вами для подтверждения."
+	}
 	if !reservationConfirmed {
 		adminText = "⚠️ ОПЛАТА ПОЛУЧЕНА, НО РЕЗЕРВ ТОВАРОВ ИСТЁК. НУЖНА РУЧНАЯ ПРОВЕРКА НАЛИЧИЯ.\n\n" + adminText
-		clientText = "✅ Оплата получена.\n\nЗаказ № " + order.OrderID + "\n\n" +
+		clientText = "✅ Тестовая оплата 1 ₽ получена.\n\nЗаказ № " + order.OrderID + "\n\n" +
 			"Срок резерва товаров истёк, поэтому мы дополнительно проверим наличие и свяжемся с вами для подтверждения заказа."
 	}
 

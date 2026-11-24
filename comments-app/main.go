@@ -3420,6 +3420,7 @@ func cartReserveHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+
 func cartClearHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -3447,6 +3448,7 @@ func cartClearHandler(w http.ResponseWriter, r *http.Request) {
 		    updated_at = now()
 		WHERE cart_token = $1
 		  AND status = 'active'
+		  AND order_id IS NULL
 	`, req.CartToken)
 
 	if err != nil {

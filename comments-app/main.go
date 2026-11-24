@@ -3235,6 +3235,7 @@ type CartReserveRequest struct {
 	Quantity  float64 `json:"quantity"`
 }
 
+
 func cartReserveHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -3262,15 +3263,17 @@ func cartReserveHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(ctx)
+
 	if req.Quantity == 0 {
 		_, err := tx.Exec(ctx, `
-        UPDATE cart_reservations
-        SET status = 'released',
-            updated_at = now()
-        WHERE cart_token = $1
-          AND product_id = $2
-          AND status = 'active'
-    `, req.CartToken, req.ProductID)
+			UPDATE cart_reservations
+			SET status = 'released',
+			    updated_at = now()
+			WHERE cart_token = $1
+			  AND product_id = $2
+			  AND status = 'active'
+			  AND order_id IS NULL
+		`, req.CartToken, req.ProductID)
 
 		if err != nil {
 			http.Error(w, "database error", http.StatusInternalServerError)
@@ -3283,6 +3286,7 @@ func cartReserveHandler(w http.ResponseWriter, r *http.Request) {
 			    updated_at = now()
 			WHERE cart_token = $1
 			  AND status = 'active'
+			  AND order_id IS NULL
 			  AND expires_at > now()
 		`, req.CartToken)
 
@@ -3329,9 +3333,9 @@ func cartReserveHandler(w http.ResponseWriter, r *http.Request) {
 		FROM cart_reservations
 		WHERE product_id = $1
 		  AND (
-          status = 'confirmed'
-          OR (status = 'active' AND expires_at > now())
-      )
+		      status = 'confirmed'
+		      OR (status = 'active' AND expires_at > now())
+		  )
 		  AND cart_token <> $2
 	`, req.ProductID, req.CartToken).Scan(&reserved)
 
@@ -3359,6 +3363,7 @@ func cartReserveHandler(w http.ResponseWriter, r *http.Request) {
 		WHERE cart_token = $2
 		  AND product_id = $3
 		  AND status = 'active'
+		  AND order_id IS NULL
 	`, req.Quantity, req.CartToken, req.ProductID)
 
 	if err != nil {
@@ -3374,6 +3379,7 @@ func cartReserveHandler(w http.ResponseWriter, r *http.Request) {
 			WHERE cart_token = $1
 			  AND product_id = $2
 			  AND status = 'active'
+			  AND order_id IS NULL
 		)
 	`, req.CartToken, req.ProductID).Scan(&exists)
 
@@ -3401,6 +3407,7 @@ func cartReserveHandler(w http.ResponseWriter, r *http.Request) {
 		    updated_at = now()
 		WHERE cart_token = $1
 		  AND status = 'active'
+		  AND order_id IS NULL
 		  AND expires_at > now()
 	`, req.CartToken)
 
@@ -3419,7 +3426,6 @@ func cartReserveHandler(w http.ResponseWriter, r *http.Request) {
 		"ok": true,
 	})
 }
-
 
 func cartClearHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

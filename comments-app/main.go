@@ -2476,7 +2476,14 @@ async function finishOrder(){
         alert("Не удалось проверить предыдущий заказ. Новый заказ пока не создаём.");
         return;
       } else {
-        const previousPayment = await statusResponse.json();
+        let previousPayment;
+
+		try {
+		  previousPayment = await statusResponse.json();
+		} catch(error) {
+		  alert("Получен некорректный ответ при проверке предыдущего заказа. Попробуйте ещё раз.");
+		  return;
+		};
 
         if(previousPayment.status === "succeeded"){
           localStorage.removeItem("alex_pending_order_id");

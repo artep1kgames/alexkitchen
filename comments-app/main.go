@@ -3859,6 +3859,8 @@ func orderPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 
 					if json.NewDecoder(resp.Body).Decode(&payment) == nil {
 						switch payment.Status {
+						case "pending", "waiting_for_capture":
+							localStatus = payment.Status					
 						case "canceled":
 							_, err = dbPool.Exec(ctx, `
 								UPDATE yookassa_payments
@@ -3950,10 +3952,6 @@ func orderPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 	`, orderID).Scan(&orderStatus)
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-
-	if localStatus == "pending" || localStatus == "waiting_for_capture" {
-		// Возвращаем актуальный статус, полученный от ЮKassa.
-	}
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"order_id":    orderID,

@@ -2486,10 +2486,22 @@ async function finishOrder(){
 		};
 
         if(previousPayment.status === "succeeded"){
-          localStorage.removeItem("alex_pending_order_id");
-          alert("Предыдущий заказ уже оплачен. Добавьте товары в новую корзину для следующей покупки.");
-          return;
-        }
+		  localStorage.removeItem("alex_pending_order_id");
+		
+		  // Оплата предыдущего заказа уже прошла — очищаем старую корзину.
+		  cart = [];
+		  cartExpiresAt = 0;
+		  localStorage.removeItem("alex_cart");
+		  localStorage.removeItem("alex_cart_expires_at");
+		
+		  cartToken = crypto.randomUUID();
+		  localStorage.setItem("alex_cart_token", cartToken);
+		
+		  updateCart();
+		
+		  alert("Предыдущий заказ уже оплачен. Корзина очищена. Добавьте товары для следующей покупки.");
+		  return;
+		}
 
         if([
           "not_started",

@@ -2598,11 +2598,15 @@ async function checkReturnedPayment(){
     return;
   }
 
-  const orderID = localStorage.getItem("alex_pending_order_id");
-
-  if(!orderID){
-    return;
-  }
+  	// Получаем ID заказа из адреса возврата или localStorage.
+	const orderID = params.get("order_id") || localStorage.getItem("alex_pending_order_id");
+	
+	if(!orderID){
+	  console.warn("Возврат из ЮKassa без order_id");
+	  return;
+	}
+	
+	localStorage.setItem("alex_pending_order_id", orderID);
 
   const deadline = Date.now() + 60000;
 
@@ -4249,7 +4253,7 @@ func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 	paymentRequest.Amount.Currency = "RUB"
 	paymentRequest.Capture = true
 	paymentRequest.Confirmation.Type = "redirect"
-	paymentRequest.Confirmation.ReturnURL = baseURL + "/shop?payment=return"
+	paymentRequest.Confirmation.ReturnURL = baseURL + "/shop?payment=return&order_id=" + url.QueryEscape(req.OrderID)
 	paymentRequest.Description = "Тестовая оплата доставки (1 ₽), заказ " + req.OrderID
 	paymentRequest.Metadata = map[string]string{
 		"order_id": req.OrderID,

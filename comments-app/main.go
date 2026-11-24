@@ -3823,12 +3823,33 @@ func orderPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 	`, orderID).Scan(&paymentID, &localStatus, &updatedAt)
 
 	if err != nil {
-		if err == pgx.ErrNoRows {
-			http.Error(w, "payment not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
+	    if err == pgx.ErrNoRows {
+	        var orderStatus string
+	        orderErr := dbPool.QueryRow(ctx, `
+	            SELECT status
+	            FROM shop_orders
+	            WHERE order_id = $1
+	        `, orderID).Scan(&orderStatus)
+	
+	        if orderErr == pgx.ErrNoRows {
+	            http.Error(w, "order not found", http.StatusNotFound)
+	            return
+	        }
+	        if orderErr != nil {
+	            http.Error(w, "database error", http.StatusInternalServerError)
+	            return
+	        }
+	
+	        w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	        _ = json.NewEncoder(w).Encode(map[string]interface{}{
+	            "order_id":     orderID,
+	            "status":       "not_started",
+	            "order_status": orderStatus,
+	        })
+	        return
+	    }
+	    http.Error(w, "database error", http.StatusInternalServerError)
+	    return
 	}
 
 	shopID := strings.TrimSpace(os.Getenv("YOOKASSA_SHOP_ID"))

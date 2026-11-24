@@ -2443,11 +2443,12 @@ async function finishOrder(){
   const email = document.getElementById("clientEmail").value.trim();
   const comment = document.getElementById("clientComment").value.trim();
 
-  // Старый ID ожидающей доставки не должен перехватывать оформление самовывоза.
+	// Проверяем старый заказ перед созданием нового.
   if(receiveType === "Самовывоз"){
     localStorage.removeItem("alex_pending_order_id");
   } else {
     const pendingOrderID = localStorage.getItem("alex_pending_order_id");
+
     if(pendingOrderID){
       if(!email){
         setReceiveType("Доставка");
@@ -2455,9 +2456,49 @@ async function finishOrder(){
         document.getElementById("clientEmail").focus();
         return;
       }
-      // Для доставки разрешаем повторить оплату уже созданного заказа.
-      await payWithYooKassa(pendingOrderID, email);
-      return;
+
+      let statusResponse;
+
+      try {
+        statusResponse = await fetch(
+          "/api/order/payment-status?order_id=" + encodeURIComponent(pendingOrderID),
+          {cache: "no-store"}
+        );
+      } catch(error) {
+        alert("Не удалось проверить предыдущий заказ. Попробуйте ещё раз.");
+        return;
+      }
+
+      if(statusResponse.status === 404){
+        // Старого заказа больше нет — разрешаем создать новый.
+        localStorage.removeItem("alex_pending_order_id");
+      } else if(!statusResponse.ok){
+        alert("Не удалось проверить предыдущий заказ. Новый заказ пока не создаём.");
+        return;
+      } else {
+        const previousPayment = await statusResponse.json();
+
+        if(previousPayment.status === "succeeded"){
+          localStorage.removeItem("alex_pending_order_id");
+          alert("Предыдущий заказ уже оплачен. Добавьте товары в новую корзину для следующей покупки.");
+          return;
+        }
+
+        if([
+          "not_started",
+          "creating",
+          "pending",
+          "waiting_for_capture",
+          "canceled"
+        ].includes(previousPayment.status)){
+          // Продолжаем оплату существующего неоплаченного заказа.
+          await payWithYooKassa(pendingOrderID, email);
+          return;
+        }
+
+        alert("Неизвестный статус предыдущего заказа. Обратитесь к продавцу.");
+        return;
+      }
     }
   }
 

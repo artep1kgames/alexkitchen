@@ -3806,136 +3806,160 @@ func orderPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	var paymentID string
-	var localStatus string
-	var updatedAt time.Time
+	var (
+		paymentID  string
+		localStatus string
+		updatedAt  time.Time
+	)
 
 	err := dbPool.QueryRow(ctx, `
-		SELECT COALESCE(payment_id, ''),
-		       status,
-		       updated_at
+		SELECT payment_id, status, updated_at
 		FROM yookassa_payments
 		WHERE order_id = $1
 	`, orderID).Scan(&paymentID, &localStatus, &updatedAt)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			http.Error(w, "Payment not found", http.StatusNotFound)
+			http.Error(w, "payment not found", http.StatusNotFound)
 			return
 		}
-		log.Printf("payment status DB error: %v", err)
-		http.Error(w, "Database error", http.StatusInternalServerError)
+		http.Error(w, "database error", http.StatusInternalServerError)
 		return
 	}
 
-	if paymentID != "" {
-		shopID := strings.TrimSpace(os.Getenv("YOOKASSA_SHOP_ID"))
-		secretKey := strings.TrimSpace(os.Getenv("YOOKASSA_SECRET_KEY"))
+	shopID := strings.TrimSpace(os.Getenv("YOOKASSA_SHOP_ID"))
+	secretKey := strings.TrimSpace(os.Getenv("YOOKASSA_SECRET_KEY"))
 
-		if shopID != "" && secretKey != "" {
-			req, err := http.NewRequestWithContext(
-				ctx,
-				http.MethodGet,
-				"https://api.yookassa.ru/v3/payments/"+url.PathEscape(paymentID),
-				nil,
-			)
-			if err == nil {
-				req.SetBasicAuth(shopID, secretKey)
+	if paymentID != "" && shopID != "" && secretKey != "" {
+		req, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodGet,
+			"https://api.yookassa.ru/v3/payments/"+paymentID,
+			nil,
+		)
+		if err == nil {
+			req.SetBasicAuth(shopID, secretKey)
 
-				client := &http.Client{Timeout: 8 * time.Second}
-				resp, requestErr := client.Do(req)
+			client := &http.Client{Timeout: 8 * time.Second}
+			resp, requestErr := client.Do(req)
 
-				if requestErr == nil {
-					defer resp.Body.Close()
+			if requestErr == nil {
+				defer resp.Body.Close()
 
-					if resp.StatusCode == http.StatusOK {
-						var payment YooKassaPaymentDetails
-						if decodeErr := json.NewDecoder(resp.Body).Decode(&payment); decodeErr == nil {
-							switch payment.Status {
-							case "canceled":
-								_, updateErr := dbPool.Exec(ctx, `
-									UPDATE yookassa_payments
-									SET status = 'canceled',
-									    updated_at = now()
-									WHERE order_id = $1
-									  AND payment_id = $2
-								`, orderID, paymentID)
-								if updateErr != nil {
-									log.Printf("failed to sync canceled payment: %v", updateErr)
-								} else {
-									localStatus = "canceled"
-								}
+				if resp.StatusCode == http.StatusOK {
+					var payment struct {
+						ID     string `json:"id"`
+						Status string `json:"status"`
+						Amount struct {
+							Value    string `json:"value"`
+							Currency string `json:"currency"`
+						} `json:"amount"`
+						Metadata map[string]string `json:"metadata"`
+					}
 
-							case "succeeded":
-								eventBody, _ := json.Marshal(map[string]interface{}{
-									"type": "notification",
-									"event": "payment.succeeded",
-									"object": map[string]interface{}{
-										"id": paymentID,
-										"status": "succeeded",
-										"amount": payment.Amount,
-										"metadata": payment.Metadata,
-									},
-								})
+					if json.NewDecoder(resp.Body).Decode(&payment) == nil {
+						switch payment.Status {
+						case "canceled":
+							_, err = dbPool.Exec(ctx, `
+								UPDATE yookassa_payments
+								SET status = 'canceled',
+									updated_at = now()
+								WHERE order_id = $1
+								  AND status <> 'succeeded'
+							`, orderID)
 
-								webhookReq := httptest.NewRequest(
+							if err == nil {
+								localStatus = "canceled"
+								updatedAt = time.Now()
+							}
+
+						case "succeeded":
+							eventBody, marshalErr := json.Marshal(map[string]interface{}{
+								"type":   "notification",
+								"event":  "payment.succeeded",
+								"object": payment,
+							})
+
+							if marshalErr == nil {
+								webhookCtx, webhookCancel := context.WithTimeout(
+									context.Background(),
+									60*time.Second,
+								)
+								defer webhookCancel()
+
+								webhookReq := httptest.NewRequestWithContext(
+									webhookCtx,
 									http.MethodPost,
 									"/api/yookassa/webhook",
 									bytes.NewReader(eventBody),
 								)
-								webhookReq.Header.Set("Content-Type", "application/json")
 
-								recorder := httptest.NewRecorder()
-								yooKassaWebhookHandler(recorder, webhookReq)
+								webhookRecorder := httptest.NewRecorder()
+								yooKassaWebhookHandler(webhookRecorder, webhookReq)
 
-								if recorder.Code < 200 || recorder.Code >= 300 {
-								    log.Printf(
-								        "internal YooKassa webhook failed for order %s: HTTP %d",
-								        orderID,
-								        recorder.Code,
-								    )
+								if webhookRecorder.Code != http.StatusOK {
+									log.Printf(
+										"payment status webhook processing returned %d for order %s: %s",
+										webhookRecorder.Code,
+										orderID,
+										webhookRecorder.Body.String(),
+									)
 								}
-								
-								// Перечитываем БД даже при ошибке уведомлений MAX:
-								// платёж мог быть успешно записан до возврата HTTP 500.
-								err = dbPool.QueryRow(ctx, `
-								    SELECT status, updated_at
-								    FROM yookassa_payments
-								    WHERE order_id = $1
+
+								refreshCtx, refreshCancel := context.WithTimeout(
+									context.Background(),
+									5*time.Second,
+								)
+								defer refreshCancel()
+
+								err = dbPool.QueryRow(refreshCtx, `
+									SELECT status, updated_at
+									FROM yookassa_payments
+									WHERE order_id = $1
 								`, orderID).Scan(&localStatus, &updatedAt)
-								
-								if err != nil {
-								    log.Printf("payment status refresh failed order_id=%s: %v", orderID, err)
-								}
 
-							case "pending", "waiting_for_capture":
-								localStatus = payment.Status
+								if err != nil {
+									log.Printf(
+										"payment status refresh failed for order %s: %v",
+										orderID,
+										err,
+									)
+								}
 							}
 						}
-					} else {
-						log.Printf("YooKassa status request returned HTTP %d", resp.StatusCode)
 					}
-				} else {
-					log.Printf("YooKassa status request failed: %v", requestErr)
 				}
+			} else {
+				log.Printf("YooKassa payment status request failed for order %s: %v", orderID, requestErr)
 			}
 		}
 	}
 
 	var orderStatus string
-	_ = dbPool.QueryRow(ctx, `
+
+	responseCtx, responseCancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer responseCancel()
+
+	_ = dbPool.QueryRow(responseCtx, `
 		SELECT COALESCE(status, '')
 		FROM shop_orders
 		WHERE order_id = $1
 	`, orderID).Scan(&orderStatus)
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	if localStatus == "pending" || localStatus == "waiting_for_capture" {
+		// Возвращаем актуальный статус, полученный от ЮKassa.
+	}
+
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"ok":             true,
-		"status":         localStatus,
-		"has_payment_id": paymentID != "",
-		"updated_at":     updatedAt,
-		"order_status":   orderStatus,
+		"order_id":    orderID,
+		"status":      localStatus,
+		"order_status": orderStatus,
+		"updated_at":  updatedAt,
 	})
 }
 

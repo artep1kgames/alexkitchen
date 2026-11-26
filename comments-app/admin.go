@@ -220,6 +220,7 @@ const adminLoginHTML = `<!DOCTYPE html>
 		}
 		.error { color: #c62828; margin-top: 14px; }
 	
+
 </style>
 </head>
 <body>
@@ -232,7 +233,8 @@ const adminLoginHTML = `<!DOCTYPE html>
 		<button type="submit">Войти</button>
 		<div class="error" id="error"></div>
 	</form>
-	<script>
+<script>
+
 		if (new URLSearchParams(location.search).has("error")) {
 			document.getElementById("error").textContent = "Неверный логин или пароль";
 		}
@@ -324,7 +326,27 @@ button,input,select,textarea{font:inherit}button{border:0;border-radius:4px;padd
 .delete-confirm-actions{display:flex;gap:10px}.delete-confirm-actions button{flex:1;min-height:42px;font-size:14px;font-weight:600}
 .delete-cancel-btn{background:#e9ecef;color:#222}.delete-confirm-btn{background:#dc3545;color:#fff}
 .status,.product-info{color:#778196;font-size:12px}
+
+#catalogSections .catalog-section{border:1px solid #c5d0dd;margin:10px 0;padding:12px;border-radius:4px}
+.catalog-section-head{display:flex;flex-wrap:wrap;align-items:center;gap:8px;background:#f2f6fa;padding:8px}
+.catalog-section-head strong{flex:1;min-width:160px}
+.catalog-category{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px;border-bottom:1px solid #e0e6ee}
+.catalog-category span{flex:1;min-width:150px}
+.catalog-section button,.catalog-category button{padding:7px 10px}
 @media(max-width:760px){body{padding:10px}header,.container,main.container{width:100%}h1{font-size:21px}.product-create{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.catalog-edit-overlay{position:fixed;inset:0;z-index:11000;background:rgba(20,32,48,.58);display:flex;align-items:center;justify-content:center;padding:18px}
+.catalog-edit-dialog{width:min(520px,100%);background:#fff;border-radius:10px;box-shadow:0 16px 50px rgba(0,0,0,.28);padding:22px;color:#24354a}
+.catalog-edit-dialog h3{margin:0 0 16px;font-size:20px}
+.catalog-edit-form{display:grid;gap:12px}
+.catalog-edit-form label{display:grid;gap:5px;font-size:13px;font-weight:600}
+.catalog-edit-form input,.catalog-edit-form textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #c5d0dd;border-radius:5px;font:inherit;font-weight:400}
+.catalog-edit-form textarea{min-height:80px;resize:vertical}
+.catalog-edit-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:5px}
+.catalog-edit-actions button{padding:10px 18px;border-radius:5px}
+.catalog-edit-cancel{background:#e9eef4;color:#24354a}
+.catalog-edit-save{background:#286bd6;color:#fff}
+
+[hidden]{display:none!important}
 </style>
 </head>
 <body>
@@ -335,6 +357,23 @@ button,input,select,textarea{font:inherit}button{border:0;border-radius:4px;padd
     </form>
 </header>
 
+
+    <nav id="adminTabs" style="display:flex;gap:8px;margin:0 0 14px">
+      <button type="button" data-tab="products" style="background:#286bd6;color:white">Товары</button>
+      <button type="button" data-tab="catalog" style="background:#d7e0eb;color:#24354a">Секции и категории</button>
+    </nav>
+    <section id="catalogPanel" hidden style="background:#fff;border:1px solid #bfc9d6;border-radius:5px;padding:16px;margin-bottom:16px">
+      <h2>Секции и категории каталога</h2>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin-bottom:14px">
+        <input id="catalogSectionName" placeholder="Название нового раздела">
+        <input id="catalogSectionDesc" placeholder="Описание раздела">
+        <input id="catalogSectionIcon" placeholder="Иконка, например 🥩" value="📦">
+        <input id="catalogSectionSort" type="number" placeholder="Порядок" value="0">
+        <button id="catalogAddSection" class="save" type="button">Добавить раздел</button>
+      </div>
+      <div id="catalogMessage" class="status"></div>
+      <div id="catalogSections"></div>
+    </section>
 <main class="container">
     <input id="search" type="search" placeholder="Поиск товара...">
     <div class="product-create">
@@ -388,7 +427,21 @@ button,input,select,textarea{font:inherit}button{border:0;border-radius:4px;padd
 	</div>
 </main>
 
+	<div id="catalogEditOverlay" class="catalog-edit-overlay" hidden>
+ <div class="catalog-edit-dialog" role="dialog" aria-modal="true" aria-labelledby="catalogEditTitle">
+  <h3 id="catalogEditTitle">Редактирование</h3>
+  <form id="catalogEditForm" class="catalog-edit-form"></form>
+ </div>
+</div>
 <script>
+function adminNotice(message){
+ let toast=document.getElementById('adminToast');
+ if(!toast){toast=document.createElement('div');toast.id='adminToast';toast.style.cssText='position:fixed;right:18px;top:18px;z-index:12000;max-width:min(420px,calc(100vw - 36px));padding:12px 16px;background:#24354a;color:white;border-radius:7px;box-shadow:0 8px 30px rgba(0,0,0,.22);font-size:14px';document.body.append(toast);}
+ toast.textContent=message;toast.hidden=false;
+ clearTimeout(window.adminToastTimer);window.adminToastTimer=setTimeout(()=>toast.hidden=true,4500);
+}
+
+
 let products = [];
 
 function updateCategoryLists() {
@@ -399,7 +452,7 @@ function updateCategoryLists() {
     const selectedCategory = categorySelect.value;
 
     const sections = [...new Set(
-        products.map(p => p.section).filter(Boolean)
+        (managedCatalogLoaded ? managedCatalog.map(s => s.name) : products.map(p => p.section)).filter(Boolean)
     )].sort((a, b) => a.localeCompare(b, 'ru'));
 
     sectionSelect.replaceChildren(
@@ -423,10 +476,7 @@ function updateSubcategories(selectedCategory = '') {
 
 	categorySelect.disabled = !section;
     const categories = [...new Set(
-        products
-            .filter(p => p.section === section)
-            .map(p => p.category)
-            .filter(Boolean)
+        (managedCatalogLoaded ? (managedCatalog.find(s=>s.name===section)?.categories||[]).map(c=>c.name) : products.filter(p => p.section === section).map(p => p.category)).filter(Boolean)
     )].sort((a, b) => a.localeCompare(b, 'ru'));
 
     categorySelect.replaceChildren(
@@ -475,7 +525,7 @@ function renderProducts() {
     container.replaceChildren();
 
     const sections = [...new Set(
-        products.map(p => p.section).filter(Boolean)
+        (managedCatalogLoaded ? managedCatalog.map(s => s.name) : products.map(p => p.section)).filter(Boolean)
     )].sort((a, b) => a.localeCompare(b, 'ru'));
 
     const priceUnits = ['100 г', '50 г', 'кг', 'шт'];
@@ -540,10 +590,7 @@ function renderProducts() {
                 const selectedSection = section.value;
 
                 const categories = [...new Set(
-                    products
-                        .filter(p => p.section === selectedSection)
-                        .map(p => p.category)
-                        .filter(Boolean)
+                    (managedCatalogLoaded ? (managedCatalog.find(s => s.name === selectedSection)?.categories || []).map(c => c.name) : products.filter(p => p.section === selectedSection).map(p => p.category)).filter(Boolean)
                 )].sort((a, b) => a.localeCompare(b, 'ru'));
 
                 category.disabled = !selectedSection;
@@ -641,7 +688,9 @@ function renderProducts() {
             imagePreview.style.objectFit = 'contain';
             imagePreview.style.display = 'block';
 
-            if (product._draftImage || product.image) {
+            if (product._draftImageFile) {
+                imagePreview.src = URL.createObjectURL(product._draftImageFile);
+            } else if (product._draftImage || product.image) {
                 imagePreview.src = product._draftImage || product.image;
             }
 
@@ -655,13 +704,13 @@ function renderProducts() {
                 if (!file) return;
 
                 if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
-                    alert('Выбери фотографию в формате JPG, PNG или WebP');
+                    adminNotice('Выбери фотографию в формате JPG, PNG или WebP');
                     imageInput.value = '';
                     return;
                 }
 
                 if (file.size > 5 * 1024 * 1024) {
-                    alert('Размер фотографии не должен превышать 5 МБ');
+                    adminNotice('Размер фотографии не должен превышать 5 МБ');
                     imageInput.value = '';
                     return;
                 }
@@ -727,7 +776,7 @@ function renderProducts() {
                 const priceValue = Number(price.value);
 
                 if (!name.value.trim() || !section.value || !category.value) {
-                    alert('Заполни название, раздел и категорию товара');
+                    adminNotice('Заполни название, раздел и категорию товара');
                     return;
                 }
 
@@ -735,7 +784,7 @@ function renderProducts() {
                     !Number.isFinite(priceValue) ||
                     priceValue < 0 ||
                     priceValue > 9999999999.99) {
-                    alert('Укажи корректную цену');
+                    adminNotice('Укажи корректную цену');
                     return;
                 }
 
@@ -743,7 +792,7 @@ function renderProducts() {
                     (!Number.isFinite(Number(stock.value)) ||
                         Number(stock.value) < 0 ||
                         Number(stock.value) > 999999999.999)) {
-                    alert('Укажи корректное количество');
+                    adminNotice('Укажи корректное количество');
                     return;
                 }
 
@@ -828,7 +877,7 @@ function renderProducts() {
                     updateCategoryLists();
 
                 } catch (error) {
-                    alert('Ошибка сохранения: ' + error.message);
+                    adminNotice('Ошибка сохранения: ' + error.message);
                     save.textContent = 'Сохранить';
                     save.classList.remove('saved');
                 } finally {
@@ -902,7 +951,7 @@ function renderProducts() {
                         await loadProducts();
 
                     } catch (error) {
-                        alert(error.message || 'Ошибка удаления товара');
+                        adminNotice(error.message || 'Ошибка удаления товара');
                         confirmButton.disabled = false;
                         confirmButton.textContent = 'Удалить';
                     }
@@ -971,7 +1020,7 @@ saveAllButton.addEventListener('click', async () => {
         const active = product._draftActive ?? product.active;
 
         if (!name.trim() || !section || !category) {
-            alert('Заполни название, раздел и категорию товара: ' + name);
+            adminNotice('Заполни название, раздел и категорию товара: ' + name);
             return;
         }
 
@@ -980,14 +1029,14 @@ saveAllButton.addEventListener('click', async () => {
         if (price === '' || price === null || price === undefined ||
             !Number.isFinite(priceValue) ||
             priceValue < 0 || priceValue > 9999999999.99) {
-            alert('Укажи корректную цену у товара: ' + name);
+            adminNotice('Укажи корректную цену у товара: ' + name);
             return;
         }
 
         if (stock !== null && stock !== undefined && stock !== '' &&
             (!Number.isFinite(Number(stock)) ||
                 Number(stock) < 0 || Number(stock) > 999999999.999)) {
-            alert('Некорректный остаток у товара: ' + name);
+            adminNotice('Некорректный остаток у товара: ' + name);
             return;
         }
 
@@ -1092,7 +1141,7 @@ saveAllButton.addEventListener('click', async () => {
         renderProducts();
 
     } catch (error) {
-        alert('Ошибка массового сохранения: ' + error.message);
+        adminNotice('Ошибка массового сохранения: ' + error.message);
         saveAllButton.textContent = 'Ошибка сохранения';
     } finally {
         saveAllButton.disabled = false;
@@ -1209,10 +1258,384 @@ document.getElementById('createProduct').addEventListener('click', async () => {
     }
 });
 
-loadProducts();
+
+let managedCatalog = [];
+let managedCatalogLoaded = false;
+const catalogPanel = document.getElementById('catalogPanel');
+const productTabElements = [
+  document.getElementById('search'), document.querySelector('.product-create'),
+  document.querySelector('.sheet-scroll'), document.querySelector('.bulk-save-container'),
+  document.getElementById('message')
+];
+document.querySelectorAll('#adminTabs button').forEach(btn => btn.addEventListener('click', () => {
+  const isCatalog = btn.dataset.tab === 'catalog';
+  catalogPanel.hidden = !isCatalog;
+  productTabElements.forEach(el => { if(el) el.hidden = isCatalog; });
+  document.querySelectorAll('#adminTabs button').forEach(b => {
+    b.style.background = b===btn ? '#286bd6' : '#d7e0eb';
+    b.style.color = b===btn ? 'white' : '#24354a';
+  });
+  if(isCatalog) loadManagedCatalog();
+}));
+async function catalogRequest(payload) {
+  const res=await fetch('/api/admin/catalog/structure',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  if(!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+function catalogNotice(text){
+ const msg=document.getElementById('catalogMessage');
+ if(msg) msg.textContent=text;
+}
+function catalogEditDialog(title, fields){
+ return new Promise(resolve=>{
+  const overlay=document.getElementById('catalogEditOverlay');
+  const form=document.getElementById('catalogEditForm');
+  document.getElementById('catalogEditTitle').textContent=title;
+  form.replaceChildren();
+  fields.forEach(field=>{
+   const label=document.createElement('label');label.textContent=field.label;
+   const input=field.type==='textarea'?document.createElement('textarea'):document.createElement('input');
+   if(field.type!=='textarea') input.type=field.type||'text';
+   input.name=field.name;input.value=field.value??'';
+   if(field.type==='number') input.step='1';
+   label.append(input);form.append(label);
+  });
+  const actions=document.createElement('div');actions.className='catalog-edit-actions';
+  const cancel=document.createElement('button');cancel.type='button';cancel.className='catalog-edit-cancel';cancel.textContent='Отмена';
+  const save=document.createElement('button');save.type='submit';save.className='catalog-edit-save';save.textContent='Сохранить';
+  actions.append(cancel,save);form.append(actions);
+  const finish=value=>{overlay.hidden=true;overlay.onclick=null;form.onsubmit=null;cancel.onclick=null;resolve(value);};
+  cancel.onclick=()=>finish(null);
+  overlay.onclick=e=>{if(e.target===overlay)finish(null);};
+  form.onsubmit=e=>{e.preventDefault();const data={};fields.forEach(f=>{const el=form.elements.namedItem(f.name);data[f.name]=f.type==='number'?Number(el.value||0):el.value.trim();});finish(data);};
+  overlay.hidden=false;form.querySelector('input,textarea')?.focus();
+ });
+}
+function catalogConfirmDialog(message){
+ return new Promise(resolve=>{
+  const overlay=document.getElementById('catalogEditOverlay');
+  const form=document.getElementById('catalogEditForm');
+  document.getElementById('catalogEditTitle').textContent='Подтверждение';
+  form.replaceChildren();
+  const text=document.createElement('p');text.textContent=message;text.style.margin='0 0 8px';form.append(text);
+  const actions=document.createElement('div');actions.className='catalog-edit-actions';
+  const cancel=document.createElement('button');cancel.type='button';cancel.className='catalog-edit-cancel';cancel.textContent='Отмена';
+  const yes=document.createElement('button');yes.type='button';yes.className='delete-confirm-btn';yes.textContent='Удалить';
+  actions.append(cancel,yes);form.append(actions);
+  const finish=value=>{overlay.hidden=true;overlay.onclick=null;cancel.onclick=null;yes.onclick=null;resolve(value);};
+  cancel.onclick=()=>finish(false);yes.onclick=()=>finish(true);
+  overlay.onclick=e=>{if(e.target===overlay)finish(false);};
+  overlay.hidden=false;
+ });
+}
+async function loadManagedCatalog() {
+ const box=document.getElementById('catalogSections');
+ try{
+  const res=await fetch('/api/catalog/structure',{cache:'no-store'});
+  if(!res.ok)throw new Error('Не удалось загрузить каталог');
+  const nextCatalog=await res.json();
+  const changed=JSON.stringify(managedCatalog)!==JSON.stringify(nextCatalog);
+  // Match stable IDs so renaming a category does not invalidate product drafts.
+  function renamedSelection(sectionName, categoryName) {
+   const oldSection=managedCatalog.find(s=>s.name===sectionName);
+   const nextSection=oldSection && nextCatalog.find(s=>s.id===oldSection.id);
+   if(!nextSection) return [sectionName,categoryName];
+   const oldCategory=(oldSection.categories||[]).find(c=>c.name===categoryName);
+   const nextCategory=oldCategory && (nextSection.categories||[]).find(c=>c.id===oldCategory.id);
+   return [nextSection.name,nextCategory ? nextCategory.name : categoryName];
+  }
+  if(changed){
+   for(const p of products){
+    const draft=renamedSelection(p._draftSection ?? p.section,p._draftCategory ?? p.category);
+    const saved=renamedSelection(p.section,p.category);
+    [p.section,p.category]=saved;
+    if(p._draftSection!==undefined) p._draftSection=draft[0];
+    if(p._draftCategory!==undefined) p._draftCategory=draft[1];
+   }
+  }
+  const newSection=document.getElementById('newSection');
+  const newCategory=document.getElementById('newCategory');
+  const selection=renamedSelection(newSection.value,newCategory.value);
+  managedCatalog=nextCatalog;managedCatalogLoaded=true;box.replaceChildren();
+  managedCatalog.forEach(section=>{
+   const card=document.createElement('div');card.className='catalog-section';
+   const head=document.createElement('div');head.className='catalog-section-head';
+   const title=document.createElement('strong');title.textContent=(section.icon||'📦')+' '+section.name+' · порядок '+section.sort;
+   const edit=document.createElement('button');edit.textContent='Редактировать раздел';
+   edit.onclick=async()=>{
+    const v=await catalogEditDialog('Редактирование раздела',[
+     {name:'name',label:'Название',value:section.name},{name:'description',label:'Описание',type:'textarea',value:section.description||''},
+     {name:'icon',label:'Иконка',value:section.icon||'📦'},{name:'sort',label:'Порядок отображения',type:'number',value:section.sort}
+    ]);if(!v||!v.name)return;
+    try{await catalogRequest({action:'update_section',id:section.id,...v});await loadManagedCatalog();catalogNotice('Раздел сохранён.');}
+    catch(e){catalogNotice('Ошибка: '+e.message);}
+   };
+   const del=document.createElement('button');del.textContent='Удалить раздел';del.className='delete-product-btn';
+   del.onclick=async()=>{if(!await catalogConfirmDialog('Удалить пустой раздел «'+section.name+'»?'))return;
+    try{await catalogRequest({action:'delete_section',id:section.id});await loadManagedCatalog();catalogNotice('Раздел удалён.');}catch(e){catalogNotice('Ошибка: '+e.message);}};
+   const add=document.createElement('button');add.textContent='+ Категория';add.className='save';
+   add.onclick=async()=>{const v=await catalogEditDialog('Новая категория',[
+    {name:'name',label:'Название категории',value:''},{name:'sort',label:'Порядок отображения',type:'number',value:0}
+   ]);if(!v||!v.name)return;
+    try{await catalogRequest({action:'create_category',section_id:section.id,...v});await loadManagedCatalog();catalogNotice('Категория добавлена.');}catch(e){catalogNotice('Ошибка: '+e.message);}};
+   head.append(title,edit,del,add);card.append(head);
+   (section.categories||[]).forEach(cat=>{
+    const row=document.createElement('div');row.className='catalog-category';
+    const label=document.createElement('span');label.textContent=cat.name+' · порядок '+cat.sort;
+    const change=document.createElement('button');change.textContent='Редактировать';
+    change.onclick=async()=>{const v=await catalogEditDialog('Редактирование категории',[
+     {name:'name',label:'Название',value:cat.name},{name:'sort',label:'Порядок отображения',type:'number',value:cat.sort}
+    ]);if(!v||!v.name)return;
+     try{await catalogRequest({action:'update_category',id:cat.id,...v});await loadManagedCatalog();catalogNotice('Категория сохранена.');}catch(e){catalogNotice('Ошибка: '+e.message);}};
+    const remove=document.createElement('button');remove.textContent='Удалить';remove.className='delete-product-btn';
+    remove.onclick=async()=>{if(!await catalogConfirmDialog('Удалить пустую категорию «'+cat.name+'»?'))return;
+     try{await catalogRequest({action:'delete_category',id:cat.id});await loadManagedCatalog();catalogNotice('Категория удалена.');}catch(e){catalogNotice('Ошибка: '+e.message);}};
+    row.append(label,change,remove);card.append(row);
+   });
+   box.append(card);
+  });
+  catalogNotice('Разделов: '+managedCatalog.length+' · структура обновлена.');
+  updateCategoryLists();
+  newSection.value=selection[0];
+  updateSubcategories(selection[1]);
+  if(changed) renderProducts();
+ }catch(e){catalogNotice(e.message);}
+}
+document.getElementById('catalogAddSection').addEventListener('click',async()=>{
+ const name=document.getElementById('catalogSectionName').value.trim();if(!name){catalogNotice('Введите название раздела.');return;}
+ try{await catalogRequest({action:'create_section',name,description:document.getElementById('catalogSectionDesc').value,
+ icon:document.getElementById('catalogSectionIcon').value,sort:Number(document.getElementById('catalogSectionSort').value||0)});
+ document.getElementById('catalogSectionName').value='';document.getElementById('catalogSectionDesc').value='';
+ await loadManagedCatalog();updateCategoryLists();
+ }catch(e){adminNotice(e.message)}
+});
+
+loadManagedCatalog().then(loadProducts);
 </script>
 </body>
 </html>`
+
+// catalogStructureHandler exposes active sections/categories for the storefront.
+func catalogStructureHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rows, err := dbPool.Query(r.Context(), `
+		SELECT s.id, s.name, s.description, s.icon, s.sort_order,
+		       c.id, c.name, c.sort_order
+		FROM product_sections s
+		LEFT JOIN product_categories c ON c.section_id=s.id AND c.active=true
+		WHERE s.active=true
+		ORDER BY s.sort_order, s.name, c.sort_order, c.name`)
+	if err != nil {
+		http.Error(w, "catalog unavailable", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	type category struct {
+		ID   int64  `json:"id"`
+		Name string `json:"name"`
+		Sort int    `json:"sort"`
+	}
+	type section struct {
+		ID          int64      `json:"id"`
+		Name        string     `json:"name"`
+		Description string     `json:"description"`
+		Icon        string     `json:"icon"`
+		Sort        int        `json:"sort"`
+		Categories  []category `json:"categories"`
+	}
+	list := []section{}
+	index := map[int64]int{}
+	for rows.Next() {
+		var sid int64
+		var name, desc, icon string
+		var sort int
+		var cid *int64
+		var cname *string
+		var csort *int
+		if err := rows.Scan(&sid, &name, &desc, &icon, &sort, &cid, &cname, &csort); err != nil {
+			http.Error(w, "catalog read failed", 500)
+			return
+		}
+		pos, ok := index[sid]
+		if !ok {
+			pos = len(list)
+			index[sid] = pos
+			list = append(list, section{ID: sid, Name: name, Description: desc, Icon: icon, Sort: sort, Categories: []category{}})
+		}
+		if cid != nil {
+			list[pos].Categories = append(list[pos].Categories, category{ID: *cid, Name: *cname, Sort: *csort})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		http.Error(w, "catalog read failed", 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(list)
+}
+
+func adminCatalogStructureHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	var req struct {
+		Action      string `json:"action"`
+		ID          int64  `json:"id"`
+		SectionID   int64  `json:"section_id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Icon        string `json:"icon"`
+		Sort        int    `json:"sort"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", 400)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Description = strings.TrimSpace(req.Description)
+	req.Icon = strings.TrimSpace(req.Icon)
+	if len(req.Name) > 100 || len(req.Description) > 500 || len(req.Icon) > 20 {
+		http.Error(w, "слишком длинное поле", 400)
+		return
+	}
+	ctx := r.Context()
+	switch req.Action {
+	case "create_section":
+		if req.Name == "" {
+			http.Error(w, "Укажите название раздела", 400)
+			return
+		}
+		_, err := dbPool.Exec(ctx, `INSERT INTO product_sections(name,description,icon,sort_order) VALUES($1,$2,COALESCE(NULLIF($3,''),'📦'),$4)`, req.Name, req.Description, req.Icon, req.Sort)
+		if err != nil {
+			http.Error(w, "Раздел уже существует или ошибка БД", 409)
+			return
+		}
+	case "update_section":
+		if req.ID <= 0 || req.Name == "" {
+			http.Error(w, "Некорректный раздел", 400)
+			return
+		}
+		tx, err := dbPool.Begin(ctx)
+		if err != nil {
+			http.Error(w, "database error", 500)
+			return
+		}
+		defer tx.Rollback(ctx)
+		var old string
+		if err = tx.QueryRow(ctx, `SELECT name FROM product_sections WHERE id=$1 FOR UPDATE`, req.ID).Scan(&old); err != nil {
+			http.Error(w, "Раздел не найден", 404)
+			return
+		}
+		_, err = tx.Exec(ctx, `UPDATE product_sections SET name=$2,description=$3,icon=COALESCE(NULLIF($4,''),'📦'),sort_order=$5 WHERE id=$1`, req.ID, req.Name, req.Description, req.Icon, req.Sort)
+		if err == nil && old != req.Name {
+			_, err = tx.Exec(ctx, `UPDATE products SET section=$2 WHERE section=$1`, old, req.Name)
+		}
+		if err != nil {
+			http.Error(w, "Не удалось сохранить раздел (возможно, имя занято)", 409)
+			return
+		}
+		if err = tx.Commit(ctx); err != nil {
+			http.Error(w, "database error", 500)
+			return
+		}
+	case "delete_section":
+		if req.ID <= 0 {
+			http.Error(w, "Некорректный ID", 400)
+			return
+		}
+		var name string
+		if err := dbPool.QueryRow(ctx, `SELECT name FROM product_sections WHERE id=$1`, req.ID).Scan(&name); err != nil {
+			http.Error(w, "Раздел не найден", 404)
+			return
+		}
+		var count int
+		if err := dbPool.QueryRow(ctx, `SELECT count(*) FROM products WHERE section=$1`, name).Scan(&count); err != nil {
+			http.Error(w, "database error", 500)
+			return
+		}
+		if count > 0 {
+			http.Error(w, "Нельзя удалить раздел: в нём есть товары. Сначала перенесите или удалите их.", 409)
+			return
+		}
+		_, err := dbPool.Exec(ctx, `DELETE FROM product_sections WHERE id=$1`, req.ID)
+		if err != nil {
+			http.Error(w, "Не удалось удалить раздел", 500)
+			return
+		}
+	case "create_category":
+		if req.SectionID <= 0 || req.Name == "" {
+			http.Error(w, "Выберите раздел и название категории", 400)
+			return
+		}
+		_, err := dbPool.Exec(ctx, `INSERT INTO product_categories(section_id,name,sort_order) VALUES($1,$2,$3)`, req.SectionID, req.Name, req.Sort)
+		if err != nil {
+			http.Error(w, "Категория уже существует или раздел не найден", 409)
+			return
+		}
+	case "update_category":
+		if req.ID <= 0 || req.Name == "" {
+			http.Error(w, "Некорректная категория", 400)
+			return
+		}
+		tx, err := dbPool.Begin(ctx)
+		if err != nil {
+			http.Error(w, "database error", 500)
+			return
+		}
+		defer tx.Rollback(ctx)
+		var old, section string
+		if err = tx.QueryRow(ctx, `SELECT c.name,s.name FROM product_categories c JOIN product_sections s ON s.id=c.section_id WHERE c.id=$1 FOR UPDATE`, req.ID).Scan(&old, &section); err != nil {
+			http.Error(w, "Категория не найдена", 404)
+			return
+		}
+		_, err = tx.Exec(ctx, `UPDATE product_categories SET name=$2,sort_order=$3 WHERE id=$1`, req.ID, req.Name, req.Sort)
+		if err == nil && old != req.Name {
+			_, err = tx.Exec(ctx, `UPDATE products SET category=$3 WHERE section=$1 AND category=$2`, section, old, req.Name)
+		}
+		if err != nil {
+			http.Error(w, "Не удалось сохранить категорию (возможно, имя занято)", 409)
+			return
+		}
+		if err = tx.Commit(ctx); err != nil {
+			http.Error(w, "database error", 500)
+			return
+		}
+	case "delete_category":
+		if req.ID <= 0 {
+			http.Error(w, "Некорректный ID", 400)
+			return
+		}
+		var section, name string
+		if err := dbPool.QueryRow(ctx, `SELECT c.name,s.name FROM product_categories c JOIN product_sections s ON s.id=c.section_id WHERE c.id=$1`, req.ID).Scan(&name, &section); err != nil {
+			http.Error(w, "Категория не найдена", 404)
+			return
+		}
+		var count int
+		if err := dbPool.QueryRow(ctx, `SELECT count(*) FROM products WHERE section=$1 AND category=$2`, section, name).Scan(&count); err != nil {
+			http.Error(w, "database error", 500)
+			return
+		}
+		if count > 0 {
+			http.Error(w, "В категории есть товары. Сначала перенесите или удалите их.", 409)
+			return
+		}
+		_, err := dbPool.Exec(ctx, `DELETE FROM product_categories WHERE id=$1`, req.ID)
+		if err != nil {
+			http.Error(w, "Не удалось удалить категорию", 500)
+			return
+		}
+	default:
+		http.Error(w, "unknown action", 400)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_, _ = w.Write([]byte(`{"success":true}`))
+}
 
 func adminPage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {

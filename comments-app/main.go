@@ -230,6 +230,43 @@ func initDB() {
 
 	log.Println("PostgreSQL подключён успешно")
 
+	// Управляемая структура каталога. Старые текстовые поля products.section/category
+	// остаются совместимыми с заказами и существующим API.
+	_, err = dbPool.Exec(context.Background(), `
+		CREATE TABLE IF NOT EXISTS product_sections (
+			id bigserial PRIMARY KEY,
+			name text NOT NULL UNIQUE,
+			description text NOT NULL DEFAULT '',
+			icon text NOT NULL DEFAULT '📦',
+			sort_order integer NOT NULL DEFAULT 0,
+			active boolean NOT NULL DEFAULT true
+		);
+		CREATE TABLE IF NOT EXISTS product_categories (
+			id bigserial PRIMARY KEY,
+			section_id bigint NOT NULL REFERENCES product_sections(id) ON DELETE CASCADE,
+			name text NOT NULL,
+			sort_order integer NOT NULL DEFAULT 0,
+			active boolean NOT NULL DEFAULT true,
+			UNIQUE(section_id, name)
+		);
+		INSERT INTO product_sections(name, sort_order)
+		SELECT section, row_number() OVER (ORDER BY section)-1
+		FROM (SELECT DISTINCT trim(section) AS section FROM products
+		      WHERE trim(COALESCE(section,'')) <> '') AS distinct_sections
+		ON CONFLICT(name) DO NOTHING;
+		INSERT INTO product_categories(section_id, name, sort_order)
+		SELECT s.id, trim(p.category),
+		       row_number() OVER (PARTITION BY s.id ORDER BY trim(p.category))-1
+		FROM (SELECT DISTINCT trim(section) section, trim(category) category
+		      FROM products WHERE trim(COALESCE(section,'')) <> ''
+		        AND trim(COALESCE(category,'')) <> '') p
+		JOIN product_sections s ON s.name=p.section
+		ON CONFLICT(section_id,name) DO NOTHING;
+	`)
+	if err != nil {
+		log.Fatalf("Не удалось подготовить структуру каталога: %v", err)
+	}
+
 	// Таблицы заказов и доставок уведомлений хранят состояние в PostgreSQL.
 	// Это исключает зависимость новых заказов от локальных JSONL/TXT-файлов.
 	_, err = dbPool.Exec(context.Background(), `
@@ -334,6 +371,8 @@ func main() {
 	http.Handle("/api/admin/products/create", requireAdmin(adminCreateProductHandler))
 	http.Handle("/api/admin/products/upload-image", requireAdmin(adminUploadProductImageHandler))
 	http.Handle("/api/admin/products/bulk-update", requireAdmin(adminBulkUpdateProductsHandler))
+	http.HandleFunc("/api/catalog/structure", catalogStructureHandler)
+	http.Handle("/api/admin/catalog/structure", requireAdmin(adminCatalogStructureHandler))
 
 	log.Println("comments app started on :8081")
 	log.Fatal(http.ListenAndServe(":8081", nil))
@@ -1531,12 +1570,22 @@ const categories = [
   {id:"social", icon:"❤️", title:"СОЦИУМ", desc:"Наши социальные проекты", items:[["Скоро добавим информацию","—","Раздел готовится"]]}
 ];
 
+let lastManagedStructureSignature = "";
+
 async function loadProductsCatalog(){
   try {
     const response = await fetch("/api/products");
     if(!response.ok) throw new Error("HTTP " + response.status);
 
     const products = await response.json();
+    let managedSections = [];
+    try {
+      const structureResponse = await fetch("/api/catalog/structure", {cache:"no-store"});
+      if (structureResponse.ok) managedSections = await structureResponse.json();
+      lastManagedStructureSignature = JSON.stringify(managedSections);
+    } catch (catalogError) {
+      console.warn("Не удалось загрузить структуру каталога:", catalogError);
+    }
 
     lastCatalogSignature = getCatalogSignature(products);
 
@@ -1548,6 +1597,21 @@ async function loadProductsCatalog(){
     };
 
     const dynamic = {};
+
+    // Создаём разделы и категории из админской структуры, даже если товаров пока нет.
+    for (const managed of managedSections) {
+      const meta = sectionMap[managed.name] || {id:"section-" + managed.id, icon:managed.icon || "📦", desc:managed.description || "Товары"};
+      const section = dynamic[managed.name] = {
+        id:meta.id, icon:managed.icon || meta.icon, title:managed.name,
+        desc:managed.description || meta.desc, subcategories:[]
+      };
+      for (const managedCategory of (managed.categories || [])) {
+        section.subcategories.push({
+          id:section.id + "-" + managedCategory.id,
+          icon:"🥩", title:managedCategory.name, desc:managedCategory.name, items:[]
+        });
+      }
+    }
 
     for(const product of products){
 
@@ -1669,13 +1733,28 @@ async function refreshProductStocks(){
 
     const products = await response.json();
 
+    // Отдельно проверяем структуру: пустые секции/категории могут измениться,
+    // даже если список товаров остался прежним.
+    let freshStructureSignature = lastManagedStructureSignature;
+    try {
+      const structureResponse = await fetch("/api/catalog/structure", {cache:"no-store"});
+      if (structureResponse.ok) {
+        freshStructureSignature = JSON.stringify(await structureResponse.json());
+      }
+    } catch (structureError) {
+      console.warn("Не удалось обновить структуру каталога:", structureError);
+    }
+    const structureChanged = lastManagedStructureSignature &&
+      freshStructureSignature !== lastManagedStructureSignature;
+
     const catalogSignature = getCatalogSignature(products);
 
-    if(lastCatalogSignature && catalogSignature !== lastCatalogSignature){
+    if((lastCatalogSignature && catalogSignature !== lastCatalogSignature) || structureChanged){
       const savedQuantities = getSelectedProductQuantities();
       const categoryId = currentCategoryId;
 
       await loadProductsCatalog();
+      lastManagedStructureSignature = freshStructureSignature;
 
       if(categoryId){
         openCategory(categoryId, savedQuantities);
@@ -1683,6 +1762,9 @@ async function refreshProductStocks(){
     }
 
     lastCatalogSignature = catalogSignature;
+    if(!lastManagedStructureSignature && freshStructureSignature){
+      lastManagedStructureSignature = freshStructureSignature;
+    }
 
     const stocks = {};
 
@@ -3235,7 +3317,6 @@ type CartReserveRequest struct {
 	Quantity  float64 `json:"quantity"`
 }
 
-
 func cartReserveHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -3879,9 +3960,9 @@ func orderPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	var (
-		paymentID  string
+		paymentID   string
 		localStatus string
-		updatedAt  time.Time
+		updatedAt   time.Time
 	)
 
 	err := dbPool.QueryRow(ctx, `
@@ -3891,33 +3972,33 @@ func orderPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 	`, orderID).Scan(&paymentID, &localStatus, &updatedAt)
 
 	if err != nil {
-	    if err == pgx.ErrNoRows {
-	        var orderStatus string
-	        orderErr := dbPool.QueryRow(ctx, `
+		if err == pgx.ErrNoRows {
+			var orderStatus string
+			orderErr := dbPool.QueryRow(ctx, `
 	            SELECT status
 	            FROM shop_orders
 	            WHERE order_id = $1
 	        `, orderID).Scan(&orderStatus)
-	
-	        if orderErr == pgx.ErrNoRows {
-	            http.Error(w, "order not found", http.StatusNotFound)
-	            return
-	        }
-	        if orderErr != nil {
-	            http.Error(w, "database error", http.StatusInternalServerError)
-	            return
-	        }
-	
-	        w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	        _ = json.NewEncoder(w).Encode(map[string]interface{}{
-	            "order_id":     orderID,
-	            "status":       "not_started",
-	            "order_status": orderStatus,
-	        })
-	        return
-	    }
-	    http.Error(w, "database error", http.StatusInternalServerError)
-	    return
+
+			if orderErr == pgx.ErrNoRows {
+				http.Error(w, "order not found", http.StatusNotFound)
+				return
+			}
+			if orderErr != nil {
+				http.Error(w, "database error", http.StatusInternalServerError)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"order_id":     orderID,
+				"status":       "not_started",
+				"order_status": orderStatus,
+			})
+			return
+		}
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
 	}
 
 	shopID := strings.TrimSpace(os.Getenv("YOOKASSA_SHOP_ID"))
@@ -3953,7 +4034,7 @@ func orderPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 					if json.NewDecoder(resp.Body).Decode(&payment) == nil {
 						switch payment.Status {
 						case "pending", "waiting_for_capture":
-							localStatus = payment.Status					
+							localStatus = payment.Status
 						case "canceled":
 							_, err = dbPool.Exec(ctx, `
 								UPDATE yookassa_payments
@@ -4047,10 +4128,10 @@ func orderPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"order_id":    orderID,
-		"status":      localStatus,
+		"order_id":     orderID,
+		"status":       localStatus,
 		"order_status": orderStatus,
-		"updated_at":  updatedAt,
+		"updated_at":   updatedAt,
 	})
 }
 
@@ -4192,7 +4273,7 @@ func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "payment data is incomplete", http.StatusConflict)
 			return
 		}
-	
+
 		// Проверяем реальный статус платежа в YooKassa,
 		// чтобы не возвращать ссылку на уже отменённую оплату.
 		checkReq, err := http.NewRequestWithContext(
@@ -4205,9 +4286,9 @@ func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "payment status check failed", http.StatusBadGateway)
 			return
 		}
-	
+
 		checkReq.SetBasicAuth(shopID, secretKey)
-	
+
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Do(checkReq)
 		if err != nil {
@@ -4215,26 +4296,26 @@ func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "payment status check failed", http.StatusBadGateway)
 			return
 		}
-	
+
 		defer resp.Body.Close()
-	
+
 		if resp.StatusCode != http.StatusOK {
 			log.Printf("YooKassa payment status returned HTTP %d order_id=%s", resp.StatusCode, req.OrderID)
 			http.Error(w, "payment status check failed", http.StatusBadGateway)
 			return
 		}
-	
+
 		var providerPayment YooKassaPaymentDetails
 		if err := json.NewDecoder(resp.Body).Decode(&providerPayment); err != nil {
 			http.Error(w, "payment status response invalid", http.StatusBadGateway)
 			return
 		}
-	
+
 		switch providerPayment.Status {
 		case "succeeded":
 			http.Error(w, "payment already succeeded", http.StatusConflict)
 			return
-	
+
 		case "canceled":
 			_, err = dbPool.Exec(
 				r.Context(),
@@ -4251,9 +4332,9 @@ func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "payment initialization failed", http.StatusInternalServerError)
 				return
 			}
-	
+
 			paymentStatus = "canceled"
-	
+
 		case "pending", "waiting_for_capture":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -4261,7 +4342,7 @@ func yooKassaPaymentHandler(w http.ResponseWriter, r *http.Request) {
 				"confirmation_url": confirmationURL,
 			})
 			return
-	
+
 		default:
 			http.Error(w, "unknown payment status", http.StatusBadGateway)
 			return
@@ -4777,20 +4858,20 @@ func yooKassaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "order status read failed", http.StatusInternalServerError)
 			return
 		}
-	
+
 		if err := tx.Commit(r.Context()); err != nil {
 			http.Error(w, "database error", http.StatusInternalServerError)
 			return
 		}
-	
+
 		reservationConfirmed := existingOrderStatus == "paid"
-	
+
 		if err := sendOrderNotifications(order, reservationConfirmed); err != nil {
 			log.Printf("MAX notification retry failed order_id=%s: %v", orderID, err)
 			http.Error(w, "notification delivery incomplete", http.StatusInternalServerError)
 			return
 		}
-	
+
 		w.WriteHeader(http.StatusOK)
 		return
 	}

@@ -219,7 +219,8 @@ const adminLoginHTML = `<!DOCTYPE html>
 			cursor: pointer;
 		}
 		.error { color: #c62828; margin-top: 14px; }
-	</style>
+	
+</style>
 </head>
 <body>
 	<form class="login" method="POST" action="/admin/login">
@@ -278,505 +279,52 @@ const adminDashboardHTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Управление товарами</title>
 <style>
-* {
-    box-sizing: border-box;
-}
-
-body {
-    margin: 0;
-    padding: 30px 20px;
-    background: #f3f5f9;
-    color: #202938;
-    font-family: Arial, sans-serif;
-}
-
-header {
-    max-width: 1200px;
-    margin: 0 auto 28px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 15px;
-}
-
-h1 {
-    font-size: 27px;
-    font-weight: 700;
-    margin: 0;
-}
-
-h2 {
-    margin: 0 0 22px;
-    font-size: 21px;
-}
-
-button, input, select, textarea {
-    font: inherit;
-}
-
-button {
-    border: 0;
-    border-radius: 10px;
-    padding: 12px 18px;
-    cursor: pointer;
-}
-
-.logout {
-    background: #263449;
-    color: white;
-}
-
-.container {
-    max-width: 1200px;
-    margin: auto;
-}
-
-#search {
-    width: 100%;
-    padding: 15px 17px;
-    border: 1px solid #e0e5ed;
-    border-radius: 12px;
-    margin-bottom: 22px;
-    background: white;
-    outline: none;
-}
-
-#search:focus,
-.product-create input:focus,
-.product-create select:focus,
-.product-create textarea:focus {
-    border-color: #4385e8;
-    box-shadow: 0 0 0 3px rgba(67,133,232,.12);
-}
-
-
-.product-create,
-.product-create * {
-    box-sizing: border-box;
-    min-width: 0;
-}
-
-.product-create {
-    width: 100%;
-    max-width: 100%;
-    overflow: hidden;
-    background: #fff;
-    padding: 30px;
-    border: 1px solid #e5eaf1;
-    border-radius: 20px;
-    box-shadow: 0 6px 24px rgba(30,45,70,.06);
-    margin-bottom: 28px;
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 16px;
-}
-
-.product-create h2 {
-    grid-column: 1 / -1;
-    margin: 0 0 8px;
-    padding-bottom: 16px;
-    border-bottom: 1px solid #edf0f5;
-    font-size: 21px;
-}
-
-.product-create input,
-.product-create select,
-.product-create textarea {
-    width: 100%;
-	max-width: 100%;
-    display: block;
-    min-width: 0;
-    min-height: 48px;
-    padding: 13px 15px;
-    border: 1px solid #dfe5ee;
-    border-radius: 11px;
-    background: #fbfcfe;
-    color: #263449;
-    font-size: 14px;
-    outline: none;
-    transition: .2s ease;
-}
-
-.product-create input:hover,
-.product-create select:hover,
-.product-create textarea:hover {
-    border-color: #b8c9e2;
-    background: #fff;
-}
-
-.product-create input:focus,
-.product-create select:focus,
-.product-create textarea:focus {
-    border-color: #4385e8;
-    background: #fff;
-    box-shadow: 0 0 0 3px rgba(67,133,232,.11);
-}
-
-.product-create textarea {
-    grid-column: 1 / -1;
-    min-height: 105px;
-    resize: vertical;
-}
-
-.product-create input[type="file"] {
-    grid-column: 1 / -1;
-    min-height: auto;
-    padding: 18px;
-    border: 1px dashed #b9c9df;
-    border-radius: 12px;
-    background: #f7f9fc;
-    cursor: pointer;
-}
-
-.product-create button {
-    grid-column: 1 / -1;
-    min-height: 50px;
-    padding: 15px;
-    border-radius: 11px;
-    font-size: 15px;
-    font-weight: 700;
-}
-
-
-.product {
-    background: white;
-    padding: 20px;
-    border: 1px solid #e9edf3;
-    border-radius: 15px;
-    margin-bottom: 13px;
-    display: grid;
-    grid-template-columns: minmax(180px, 1fr) 130px 130px 120px 100px 110px;
-    gap: 14px;
-    align-items: center;
-    box-shadow: 0 3px 12px rgba(30,45,70,.035);
-}
-
-
-.product {
-    display: flex;
-    flex-direction: column;
-    align-items: stretch;
-    gap: 16px;
-}
-
-.product-edit-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 14px;
-    width: 100%;
-}
-
-.product-edit-field {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    min-width: 0;
-    font-size: 14px;
-    font-weight: 600;
-    color: #344054;
-}
-
-.product-edit-field input,
-.product-edit-field select,
-.product-edit-field textarea {
-    width: 100%;
-    min-width: 0;
-    box-sizing: border-box;
-    min-height: 44px;
-    padding: 10px 12px;
-    border: 1px solid #d9e0e9;
-    border-radius: 8px;
-    background: #fff;
-    font: inherit;
-    font-weight: 400;
-}
-
-.product-edit-field textarea {
-    resize: vertical;
-    min-height: 90px;
-}
-
-.product-image {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 10px;
-}
-
-.product-active {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-
-@media(max-width: 520px) {
-    .product-edit-grid {
-        grid-template-columns: 1fr;
-        gap: 12px;
-    }
-
-    .product {
-        padding: 16px;
-    }
-
-    .product-actions {
-        flex-direction: column;
-        width: 100%;
-    }
-
-    .product-actions button {
-        width: 100%;
-        min-height: 46px;
-    }
-}
-
-.product-name {
-    font-weight: bold;
-}
-
-.product-image {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    min-width: 0;
-}
-
-.product-image img {
-    width: 100px;
-    height: 80px;
-    object-fit: contain;
-    border: 1px solid #eee;
-    border-radius: 8px;
-    background: #fafafa;
-}
-
-.product-image input[type="file"] {
-    width: 100%;
-    max-width: 180px;
-    font-size: 11px;
-}
-
-.product-info {
-    color: #778196;
-    font-size: 13px;
-    margin-top: 5px;
-}
-
-.product input[type="number"],
-.product input[type="text"] {
-    width: 100%;
-    padding: 10px;
-    border: 1px solid #dfe4ec;
-    border-radius: 8px;
-}
-
-.product input[type="checkbox"] {
-    width: 20px;
-    height: 20px;
-}
-
-.save {
-    background: #286bd6;
-    color: white;
-    width: 100%;
-    font-weight: 600;
-    transition: background-color .3s, transform .2s;
-}
-
-.delete-product-btn {
-    background: #dc3545;
-    color: #fff;
-    padding: 10px 14px;
-    cursor: pointer;
-    font-size: 14px;
-    font-weight: 600;
-}
-
-.product-actions {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    width: 100%;
-}
-
-.product-actions button {
-    flex: 1;
-    min-width: 0;
-    min-height: 42px;
-    box-sizing: border-box;
-}
-
-.delete-confirm-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 10000;
-    background: rgba(0, 0, 0, 0.6);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 20px;
-}
-
-.delete-confirm-modal {
-    background: #fff;
-    color: #222;
-    width: 100%;
-    max-width: 400px;
-    padding: 24px;
-    border-radius: 12px;
-    box-sizing: border-box;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
-}
-
-.delete-confirm-modal h3 {
-    margin: 0 0 12px;
-    font-size: 20px;
-}
-
-.delete-confirm-modal p {
-    margin: 0 0 22px;
-    line-height: 1.5;
-}
-
-.delete-confirm-actions {
-    display: flex;
-    gap: 10px;
-}
-
-.delete-confirm-actions button {
-    flex: 1;
-    min-height: 42px;
-    border: none;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 14px;
-    font-weight: 600;
-}
-
-.delete-cancel-btn {
-    background: #e9ecef;
-    color: #222;
-}
-
-.delete-confirm-btn {
-    background: #dc3545;
-    color: #fff;
-}
-
-.delete-product-btn:hover {
-    background: #b02a37;
-}
-
-.delete-product-btn:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-}
-
-.save:active {
-    transform: scale(.98);
-}
-
-.save.saved {
-    background: #239b61;
-}
-
-.bulk-save-container {
-    margin: 25px 0 40px;
-}
-
-.save-all {
-    position: sticky;
-    bottom: 15px;
-    z-index: 10;
-    padding: 17px;
-    font-size: 16px;
-    font-weight: bold;
-    box-shadow: 0 5px 18px rgba(0,0,0,.18);
-}
-
-.save:disabled {
-    opacity: .5;
-    cursor: wait;
-}
-
-.status {
-    font-size: 13px;
-    color: #778196;
-}
-
-#message {
-    margin: 15px 0;
-}
-
-@media(max-width: 850px) {
-    body {
-        padding: 18px 12px;
-    }
-
-    header {
-        align-items: center;
-    }
-
-    h1 {
-        font-size: 22px;
-    }
-
-    .product {
-        grid-template-columns: 1fr 1fr;
-    }
-
-    .product-image {
-        grid-column: 1 / -1;
-        flex-direction: row;
-        align-items: center;
-        flex-wrap: wrap;
-    }
-
-    .product-image img {
-        width: 90px;
-        height: 75px;
-    }
-
-    .product-info,
-    .product-name,
-    .save {
-        grid-column: 1 / -1;
-    }
-}
-
-@media(max-width: 520px) {
-    .product-create {
-    grid-template-columns: 1fr;
-    padding: 19px;
-    gap: 12px;
-    border-radius: 15px;
-}
-
-.product-create h2,
-.product-create textarea,
-.product-create input[type="file"],
-.product-create button {
-    grid-column: 1;
-}
-
-.product-create h2 {
-    font-size: 19px;
-}
-
-.product-create input,
-.product-create select,
-.product-create textarea {
-    font-size: 14px;
-    min-height: 46px;
-}
-
-.product-create textarea {
-    min-height: 95px;
-}
-    h1 {
-        font-size: 19px;
-    }
-}
+*{box-sizing:border-box}
+body{margin:0;padding:18px 24px;background:#eef1f5;color:#202938;font-family:Arial,sans-serif}
+header{width:min(98%,1900px);margin:0 auto 16px;display:flex;justify-content:space-between;align-items:center;gap:15px}
+h1{margin:0;font-size:26px}h2{margin:0 0 14px;font-size:19px}
+button,input,select,textarea{font:inherit}button{border:0;border-radius:4px;padding:9px 13px;cursor:pointer}
+.logout{background:#263449;color:#fff}
+.container,main.container{width:min(98%,1900px);max-width:1900px;margin:0 auto}
+#search{width:100%;margin:0 0 14px;padding:11px 13px;border:1px solid #c4cedb;border-radius:4px;background:#fff}
+.product-create{width:100%;margin:0 0 16px;padding:16px 18px;display:grid;grid-template-columns:repeat(4,minmax(130px,1fr));gap:9px 10px;background:#fff;border:1px solid #bfc9d6;border-radius:5px}
+.product-create h2{grid-column:1/-1;margin:0;padding-bottom:9px;border-bottom:1px solid #d2dbe6}
+.product-create input,.product-create select,.product-create textarea{width:100%;min-width:0;min-height:38px;padding:7px 9px;border:1px solid #c4cedb;border-radius:3px;background:#fff;font-size:13px}
+.product-create textarea,.product-create input[type=file],.product-create button{grid-column:1/-1}
+.product-create textarea{min-height:60px;resize:vertical}
+#message{margin:12px 0;color:#566579;font-size:13px}
+
+/* Single Excel-like grid: header and each product use the same 11 columns. */
+.sheet-scroll{width:100%;overflow-x:auto;border:1px solid #aeb9c8;background:#fff}
+.product-sheet-head,.product{display:grid;grid-template-columns:190px 150px 160px 115px 125px 115px 125px minmax(260px,1.5fr) 180px 105px 125px;min-width:1750px}
+.product-sheet-head{background:#cbd8e8;color:#24354a;font-size:12px;font-weight:700;position:sticky;top:0;z-index:2}
+.product-sheet-head span{padding:9px 8px;border-right:1px solid #aeb9c8;border-bottom:1px solid #aeb9c8}
+#products{min-width:1750px}
+.product{gap:0;align-items:stretch;margin:0;padding:0;border:0;border-bottom:1px solid #b9c4d2;border-radius:0;box-shadow:none;background:#fff}
+.product:nth-child(even){background:#f5f8fc}
+.product-name{display:none}
+.product-edit-grid{display:contents}
+.product-edit-field{display:flex;flex-direction:column;justify-content:flex-start;min-width:0;gap:5px;padding:8px;border-right:1px solid #d2dbe6;border-bottom:1px solid #d2dbe6;color:#344054;font-size:11px;font-weight:600}
+.product-edit-field input,.product-edit-field select,.product-edit-field textarea{width:100%;min-width:0;min-height:36px;padding:6px;border:1px solid #c4cedb;border-radius:2px;background:#fff;font-size:12px;font-weight:400}
+.product-edit-field textarea{min-height:80px;resize:vertical}
+.product-image{display:flex;flex-direction:column;align-items:center;gap:8px;min-width:0;padding:8px;border-right:1px solid #d2dbe6;border-bottom:1px solid #d2dbe6;font-size:11px}
+.product-image img{width:155px!important;height:125px!important;max-width:100%;object-fit:contain;display:block;background:#fff;border:1px solid #c4cedb;cursor:zoom-in}
+.product-image input[type=file]{width:100%;max-width:100%;font-size:10px}
+.product-active{display:flex;align-items:center;justify-content:center;gap:6px;padding:8px;border-right:1px solid #d2dbe6;border-bottom:1px solid #d2dbe6;font-size:12px}
+.product-active input[type=checkbox]{width:18px;height:18px}
+.product-actions{display:flex;flex-direction:column;justify-content:center;gap:7px;min-width:0;padding:8px;border-bottom:1px solid #d2dbe6}
+.product-actions button{width:100%;min-width:0;min-height:36px;padding:6px;border-radius:3px;font-size:11px}
+.save{width:100%;background:#286bd6;color:#fff;font-weight:600}
+.save:disabled{opacity:.5;cursor:wait}.save.saved{background:#239b61}
+.delete-product-btn{background:#dc3545;color:#fff}.delete-product-btn:hover{background:#b02a37}
+.save-all{position:sticky;bottom:12px;width:100%}.bulk-save-container{margin:20px 0 35px}
+.delete-confirm-overlay{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.6)}
+.delete-confirm-modal{width:100%;max-width:400px;padding:24px;border-radius:8px;background:#fff;color:#222;box-shadow:0 10px 40px rgba(0,0,0,.25)}
+.delete-confirm-modal h3{margin:0 0 12px;font-size:20px}.delete-confirm-modal p{margin:0 0 22px;line-height:1.5}
+.delete-confirm-actions{display:flex;gap:10px}.delete-confirm-actions button{flex:1;min-height:42px;font-size:14px;font-weight:600}
+.delete-cancel-btn{background:#e9ecef;color:#222}.delete-confirm-btn{background:#dc3545;color:#fff}
+.status,.product-info{color:#778196;font-size:12px}
+@media(max-width:760px){body{padding:10px}header,.container,main.container{width:100%}h1{font-size:21px}.product-create{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style>
 </head>
 <body>
@@ -824,7 +372,14 @@ button {
 		<button id="createProduct" class="save" type="button">Добавить товар</button>
 	</div>
 	<div id="message">Загрузка товаров...</div>
-    <div id="products"></div>
+    <div class="sheet-scroll">
+      <div class="product-sheet-head" aria-hidden="true">
+        <span>Название</span><span>Раздел</span><span>Категория</span><span>Цена</span>
+        <span>Ед. цены</span><span>Остаток</span><span>Ед. остатка</span><span>Описание</span>
+        <span>Фото</span><span>Активен</span><span>Действия</span>
+      </div>
+      <div id="products"></div>
+    </div>
 
 	<div class="bulk-save-container">
 		<button id="saveAll" class="save save-all" type="button">
@@ -959,7 +514,7 @@ function renderProducts() {
 
             const heading = document.createElement('div');
             heading.className = 'product-name';
-            heading.textContent = 'Редактирование товара';
+            heading.textContent = product._draftName ?? product.name ?? 'Товар';
 
             const fields = document.createElement('div');
             fields.className = 'product-edit-grid';
@@ -1081,8 +636,8 @@ function renderProducts() {
 
             const imagePreview = document.createElement('img');
             imagePreview.alt = product.name || 'Фотография товара';
-            imagePreview.style.width = '120px';
-            imagePreview.style.height = '100px';
+            imagePreview.style.width = '155px';
+            imagePreview.style.height = '125px';
             imagePreview.style.objectFit = 'contain';
             imagePreview.style.display = 'block';
 
@@ -1116,6 +671,9 @@ function renderProducts() {
             });
 
             imageWrapper.append(imageLabel, imagePreview, imageInput);
+            imagePreview.addEventListener('click', () => {
+                if (imagePreview.src) window.open(imagePreview.src, '_blank', 'noopener');
+            });
 
             // Активность
             const activeWrapper = document.createElement('label');
@@ -1357,7 +915,6 @@ function renderProducts() {
             actions.append(save, deleteButton);
 
             card.append(
-                heading,
                 fields,
                 imageWrapper,
                 activeWrapper,
